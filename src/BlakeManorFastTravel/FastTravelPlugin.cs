@@ -424,6 +424,39 @@ namespace BlakeManorFastTravel
                 {
                     LogDoorLink(actionList, unlockAction, sceneAction);
                 }
+                else if (sceneAction != null)
+                {
+                    // A scene-changing ActionList with no ActionEHUnlockDoor paired with it -
+                    // whatever gates this door (if anything), it isn't the key system. Log
+                    // every action type present so we can see what condition/check actually
+                    // surrounds the scene change (e.g. a time/TickZone check for something
+                    // like the Dining Room's "closed outside of meal times" restriction).
+                    LogUnpairedSceneChange(actionList, sceneAction);
+                }
+            }
+        }
+
+        private void LogUnpairedSceneChange(AC.ActionList actionList, ActionScene_EH sceneAction)
+        {
+            EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
+            string fromHandle = current?.handle ?? "unknown";
+            List<string> actionTypeNames = new List<string>();
+            foreach (AC.Action action in actionList.actions)
+            {
+                actionTypeNames.Add(action?.GetType().Name ?? "null");
+            }
+            string line =
+                $"[{DateTime.Now:HH:mm:ss}] UNPAIRED destHandle='{sceneAction.sceneHandle}' fromRoom='{fromHandle}' " +
+                $"actionList='{actionList.name}' actions=[{string.Join(", ", actionTypeNames)}]";
+
+            Logger.LogInfo("[BlakeManorFastTravel] " + line);
+            try
+            {
+                File.AppendAllText(_doorLinksLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] Failed to write door_links.log: " + ex.Message);
             }
         }
 
