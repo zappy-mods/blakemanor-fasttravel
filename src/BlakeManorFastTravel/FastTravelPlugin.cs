@@ -595,10 +595,10 @@ namespace BlakeManorFastTravel
 
             GUILayout.BeginHorizontal();
             GUILayout.Space(20);
-            // Solid gold fill (LockToggleOn) reads as "active" when on; the dark wine fill
-            // every destination button uses reads as "off"/blending into the panel rather
-            // than a fully transparent background, which looked like an empty gap here.
-            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.LockToggleOn : MenuTheme.DestinationButton;
+            // Solid gold fill (LockToggleOn) means "locks are on" (enforced, the default);
+            // the dark wine fill every destination button uses means "off" (ignored),
+            // reading as blending into the panel rather than a fully transparent gap.
+            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.DestinationButton : MenuTheme.LockToggleOn;
             if (GUILayout.Button(_ignoreAccessChecks ? "Locks: Ignored" : "Locks: Enforced", toggleStyle, GUILayout.Width(150f * scale), GUILayout.Height(30f * scale)))
             {
                 _ignoreAccessChecks = !_ignoreAccessChecks;
