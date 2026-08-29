@@ -20,13 +20,25 @@ namespace BlakeManorFastTravel
     //
     // Caveat: this variable is keyed on the room's *handle*, and a single physical room
     // can be represented by several distinct SceneCollection assets (different
-    // chapters/times-of-day/story states sharing one handle) - so "room.<handle> == 2"
-    // only proves *some* variant of that room was visited, not necessarily the specific
-    // variant a given menu entry points to. Fast traveling into an unvisited variant can
-    // load a scene whose state/prerequisites were never set up, which has crashed the game
-    // before. A stricter, crash-proof version of this check (tracking the exact visited
-    // SceneCollection rather than the shared handle) is available if that trade-off isn't
-    // wanted.
+    // chapters/times-of-day/story states sharing one handle). Fast travel should still
+    // work across those - e.g. having visited the Lobby on day 2 evening should let you
+    // fast travel there on day 3 morning - but it must land you in *today's* variant of
+    // the room, not the literal historical asset you happened to visit it through.
+    //
+    // The crash this used to hit: EHSceneChanger.LoadLevelASync indexes
+    // destination.generatedScenesLoadingGroup[(int)SceneAppearanceController.sceneState]
+    // with no bounds check. sceneState is a global, ever-advancing appearance/chapter
+    // index, and each SceneCollection asset's generatedScenesLoadingGroup list is only
+    // ever as long as the range of states that asset was authored to support. Handing it
+    // a stale asset (e.g. the day-2-evening Lobby, on day 3 morning) can index past the
+    // end of that list and hard-crash the game.
+    //
+    // GetDiscoveredDestinations() below fixes this at the source: it dedupes by handle
+    // and, among all assets sharing a handle, only offers ones where sceneState is
+    // actually in range for that asset's generatedScenesLoadingGroup, preferring
+    // whichever variant's TickZoneDay1/TickZoneDay2 matches the current day. TravelTo()
+    // also re-checks the bounds right before loading, so even if that selection is ever
+    // wrong we fail soft (a status message) instead of crashing.
     //
     // We reuse the exact scene-change call the game's own doors/debug menu use
     // (EHSceneChanger.ChangeScene) so loading, saving of room state, and player placement
@@ -100,15 +112,18 @@ namespace BlakeManorFastTravel
 
         private List<EHSceneCollection> GetDiscoveredDestinations()
         {
-            List<EHSceneCollection> list = new List<EHSceneCollection>();
-
             SpookyDoorway.SceneCollectionsManager manager = EHKickStarter.SceneCollectionsManager;
             if (manager == null || manager.Collections == null)
             {
-                return list;
+                return new List<EHSceneCollection>();
             }
 
             SpookyDoorway.SceneCollection current = manager.GetCurrentlyOpenCollection();
+            int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
+
+            // One entry per handle - among all assets sharing a handle, keep only the
+            // best candidate for "today's" version of that room.
+            Dictionary<string, EHSceneCollection> bestByHandle = new Dictionary<string, EHSceneCollection>();
 
             foreach (SpookyDoorway.SceneCollection collection in manager.Collections)
             {
@@ -134,11 +149,37 @@ namespace BlakeManorFastTravel
                     continue; // not yet actually visited by the player
                 }
 
-                list.Add(ehCollection);
+                // Skip anything that can't support today's global appearance state - this
+                // is the exact bounds check EHSceneChanger.LoadLevelASync itself omits
+                // before indexing generatedScenesLoadingGroup, so anything that fails it
+                // would crash on load.
+                if (currentAppearanceIndex < 0 ||
+                    currentAppearanceIndex >= ehCollection.generatedScenesLoadingGroup.Count)
+                {
+                    continue;
+                }
+
+                if (!bestByHandle.TryGetValue(ehCollection.handle, out EHSceneCollection existing) ||
+                    IsBetterVariantForToday(ehCollection, existing))
+                {
+                    bestByHandle[ehCollection.handle] = ehCollection;
+                }
             }
 
+            List<EHSceneCollection> list = new List<EHSceneCollection>(bestByHandle.Values);
             list.Sort((a, b) => string.Compare(DisplayName(a), DisplayName(b), StringComparison.OrdinalIgnoreCase));
             return list;
+        }
+
+        // Prefers whichever candidate's tick zone for the current day actually applies
+        // (i.e. isn't None) - a best-effort match for "the version of this room that's
+        // current right now", using the same day/tick-zone fields EHSceneChanger reads.
+        private static bool IsBetterVariantForToday(EHSceneCollection candidate, EHSceneCollection existing)
+        {
+            int currentDay = EHKickStarter.RuntimeTimeManager.ReturnCopyOfActiveBucket.day;
+            EHSceneCollection.TickZone candidateZone = currentDay > 1 ? candidate.TickZoneDay2 : candidate.TickZoneDay1;
+            EHSceneCollection.TickZone existingZone = currentDay > 1 ? existing.TickZoneDay2 : existing.TickZoneDay1;
+            return candidateZone != EHSceneCollection.TickZone.None && existingZone == EHSceneCollection.TickZone.None;
         }
 
         private static string DisplayName(EHSceneCollection collection)
@@ -230,6 +271,20 @@ namespace BlakeManorFastTravel
         {
             try
             {
+                // Belt-and-suspenders re-check: GetDiscoveredDestinations() should only
+                // ever hand us an in-bounds destination, but re-verify right before the
+                // scene load actually happens (the source of truth this mirrors is
+                // EHSceneChanger.LoadLevelASync's generatedScenesLoadingGroup[index]
+                // lookup, which has no bounds check of its own and is what crashes the
+                // game if handed a stale/incompatible variant).
+                int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
+                if (currentAppearanceIndex < 0 ||
+                    currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count)
+                {
+                    _statusMessage = "Can't fast travel there right now - try again after moving normally.";
+                    return;
+                }
+
                 SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager.GetCurrentlyOpenCollection();
                 string unloadPath = current != null ? current.Path : string.Empty;
 
