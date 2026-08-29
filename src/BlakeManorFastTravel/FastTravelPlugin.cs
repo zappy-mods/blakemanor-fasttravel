@@ -50,11 +50,25 @@ namespace BlakeManorFastTravel
         public const string PluginName = "Blake Manor Fast Travel";
         public const string PluginVersion = "1.0.0";
 
+        private const float DefaultWidth = 440f;
+        private const float DefaultHeight = 520f;
+        private const float MinWidth = 320f;
+        private const float MinHeight = 300f;
+        private const float MaxWidth = 900f;
+        private const float MaxHeight = 820f;
+        private const float ResizeHandleSize = 18f;
+
         private bool _menuOpen;
         private Vector2 _scrollPos;
         private GameState _previousGameState = GameState.Normal;
         private List<EHSceneCollection> _destinations = new List<EHSceneCollection>();
         private string _statusMessage = "";
+
+        // Top-left-anchored so resizing (via the bottom-right grip) only ever grows/shrinks
+        // to the right/down - the window doesn't jump around under the cursor while dragging.
+        // Re-centered on screen each time the menu is opened; size is kept across opens.
+        private Rect _windowRect = new Rect(0f, 0f, DefaultWidth, DefaultHeight);
+        private bool _resizingWindow;
 
         private void Update()
         {
@@ -99,6 +113,10 @@ namespace BlakeManorFastTravel
             _previousGameState = KickStarter.stateHandler.gameState;
             KickStarter.stateHandler.gameState = GameState.Paused;
             _menuOpen = true;
+
+            // Re-center on screen, but keep whatever size the player last resized it to.
+            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
+            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
         }
 
         private void CloseMenu()
@@ -199,12 +217,10 @@ namespace BlakeManorFastTravel
             // Dim the world behind the menu, same as the game's own popups do.
             GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), MenuTheme.Overlay);
 
-            const float w = 440f;
-            const float h = 520f;
-            Rect windowRect = new Rect((Screen.width - w) / 2f, (Screen.height - h) / 2f, w, h);
+            HandleResize();
 
-            GUI.Box(windowRect, GUIContent.none, MenuTheme.Panel);
-            GUILayout.BeginArea(windowRect);
+            GUI.Box(_windowRect, GUIContent.none, MenuTheme.Panel);
+            GUILayout.BeginArea(_windowRect);
             GUILayout.Space(18);
             GUILayout.Label("FAST TRAVEL", MenuTheme.Title);
             GUILayout.Space(4);
@@ -265,6 +281,56 @@ namespace BlakeManorFastTravel
             GUILayout.EndHorizontal();
             GUILayout.Space(14);
             GUILayout.EndArea();
+
+            DrawResizeGrip();
+        }
+
+        // Drag-to-resize from the bottom-right corner. _windowRect's top-left stays put,
+        // so this is just "grow/shrink width and height by however far the mouse moved".
+        private void HandleResize()
+        {
+            Event e = Event.current;
+            Rect handleRect = new Rect(
+                _windowRect.xMax - ResizeHandleSize,
+                _windowRect.yMax - ResizeHandleSize,
+                ResizeHandleSize,
+                ResizeHandleSize);
+
+            if (e.type == EventType.MouseDown && e.button == 0 && handleRect.Contains(e.mousePosition))
+            {
+                _resizingWindow = true;
+                e.Use();
+            }
+            else if (_resizingWindow && e.type == EventType.MouseDrag)
+            {
+                _windowRect.width = Mathf.Clamp(_windowRect.width + e.delta.x, MinWidth, MaxWidth);
+                _windowRect.height = Mathf.Clamp(_windowRect.height + e.delta.y, MinHeight, MaxHeight);
+                e.Use();
+            }
+            else if (_resizingWindow && (e.type == EventType.MouseUp || e.rawType == EventType.MouseUp))
+            {
+                _resizingWindow = false;
+                e.Use();
+            }
+        }
+
+        // A small diagonal dot-grid in the corner, echoing the panel's gold rule line -
+        // just enough to read as "draggable" without looking like a modern OS widget.
+        private void DrawResizeGrip()
+        {
+            const float dot = 3f;
+            const float gap = 5f;
+            float baseX = _windowRect.xMax - 6f;
+            float baseY = _windowRect.yMax - 6f;
+            for (int row = 0; row < 3; row++)
+            {
+                for (int col = 0; col <= row; col++)
+                {
+                    float x = baseX - row * gap + col * gap;
+                    float y = baseY - row * gap;
+                    GUI.DrawTexture(new Rect(x, y, dot, dot), MenuTheme.Rule);
+                }
+            }
         }
 
         private void TravelTo(EHSceneCollection destination)
