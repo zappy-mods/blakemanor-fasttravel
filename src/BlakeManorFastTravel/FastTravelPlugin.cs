@@ -220,6 +220,12 @@ namespace BlakeManorFastTravel
                 // Don't pop the menu open mid-cutscene/dialogue/etc.
                 return;
             }
+            if (KickStarter.sceneChanger.IsLoading())
+            {
+                // Don't let a second fast travel get queued up while one is still loading -
+                // see the comment on the same check in TravelTo() for why that matters.
+                return;
+            }
 
             _destinations = GetDiscoveredDestinations();
             _statusMessage = "";
@@ -587,6 +593,23 @@ namespace BlakeManorFastTravel
         {
             try
             {
+                // EHSceneChanger.ChangeScene() opens with:
+                //   if (isLoading || ...) { return; }
+                // - if a scene change is already in progress, calling it again is a silent
+                // no-op: the actual load is dropped, but everything ChangeScene does *before*
+                // that check (hiding menus, exiting analysis mode, etc.) still runs. That's a
+                // real failure mode we hit: fast travel triggered while a previous one hadn't
+                // finished loading leaves the screen stuck on the old (already-partway-torn-
+                // down) scene while whatever ambient audio/cues fired regardless keep playing -
+                // audio, but no picture. Checking IsLoading() here (the same public accessor
+                // TryOpenMenu() uses to keep the menu from reopening mid-load) turns that into
+                // a clean, visible refusal instead of a silent half-transition.
+                if (KickStarter.sceneChanger != null && KickStarter.sceneChanger.IsLoading())
+                {
+                    _statusMessage = "Still loading the last destination - try again in a moment.";
+                    return;
+                }
+
                 // Belt-and-suspenders re-check: GetDiscoveredDestinations() should only
                 // ever hand us an in-bounds destination, but re-verify right before the
                 // scene load actually happens (the source of truth this mirrors is
