@@ -358,16 +358,22 @@ namespace BlakeManorFastTravel
 
             _destinations = GetDiscoveredDestinations();
             _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
-            // Paused, not Normal: Paused is what actually triggers AC's own menu-mode
-            // behavior (frees the mouse cursor, suspends first-person camera control while
-            // a UI is up) - the same state TryOpenMenu() uses normally. Setting Normal here
-            // was the bug: it left first-person camera-look still capturing the mouse
-            // (broken, since that's what got stuck) with no cursor for the menu at all.
-            // _previousGameState stays Normal, though, so CloseMenu() resolves to a working
-            // state on exit rather than back to whatever was actually stuck.
+            // Paused is what actually triggers AC's own menu-mode behavior (frees the mouse
+            // cursor, suspends first-person camera control while a UI is up) - the same
+            // state TryOpenMenu() uses normally. But jumping straight to Paused from
+            // whatever broken state we're recovering from only fixed the cursor, not
+            // camera-look - it kept consuming raw mouse movement independently of the
+            // cursor. What actually cleared that (confirmed by testing) was transitioning
+            // all the way back to Normal first - closing the menu via Escape, which sets
+            // gameState = Normal, is what re-armed it. So: pass through Normal here too,
+            // as an explicit assignment of its own, before settling on Paused - that gets
+            // the same fix without making the player Escape out and back in manually.
+            // _previousGameState stays Normal either way, so CloseMenu() resolves to a
+            // working state on exit regardless.
             _previousGameState = GameState.Normal;
             if (KickStarter.stateHandler != null)
             {
+                KickStarter.stateHandler.gameState = GameState.Normal;
                 KickStarter.stateHandler.gameState = GameState.Paused;
             }
             _menuOpen = true;
