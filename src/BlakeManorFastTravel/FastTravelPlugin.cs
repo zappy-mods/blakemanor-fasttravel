@@ -8,6 +8,7 @@ using SpookyDoorway.EldritchHouse.Runtime.AC.UI.Journal.Map;
 using SpookyDoorway.EldritchHouse.Runtime.Tools;
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.SceneManagement;
 
 namespace BlakeManorFastTravel
 {
@@ -46,16 +47,28 @@ namespace BlakeManorFastTravel
     // (EHSceneChanger.ChangeScene) so loading, saving of room state, and player placement
     // in the destination scene all behave exactly like a normal room transition.
     //
-    // Two more things this plugin does around that load, both because fast travel's direct
-    // cross-region jump exposed a base-game rough edge that door-by-door movement mostly
-    // hides: (1) a Harmony patch silences MapArea.GetTimeTableDataForLocationAndTime()'s
-    // per-entry Debug.Log/Debug.LogWarning spam - that method is a synchronous, unbatched
-    // scan run once per journal map area on every scene change, and Unity's Debug.Log is
-    // expensive enough (stack-trace capture per call) that logging alone can make a
-    // multi-region jump look like a hang. We only suppress logging - the method's actual
-    // return value/behavior is untouched. (2) TravelTo() shows a small "Traveling..." toast
-    // for as long as that load is still in flight, so a slow load reads as "working", not
-    // "frozen".
+    // A few more things this plugin does around that load, all because fast travel's direct
+    // cross-region jump exposed base-game rough edges that door-by-door movement mostly
+    // hides:
+    //
+    // (1) A Harmony patch silences MapArea.GetTimeTableDataForLocationAndTime()'s per-entry
+    // Debug.Log/Debug.LogWarning spam - that method is a synchronous, unbatched scan run
+    // once per journal map area on every scene change, and Unity's Debug.Log is expensive
+    // enough (stack-trace capture per call) that logging alone can make a multi-region jump
+    // look like a hang.
+    //
+    // (2) A second Harmony patch silences the same kind of spam in
+    // SceneCollectionsManager.GetCurrentlyOpenCollection(): on a miss it string-concatenates
+    // every registered scene collection's names (~140 of them) into an error, and it misses
+    // on every call made while the active scene is still the intermediate "Loading" scene.
+    //
+    // Both patches only suppress logging - the patched methods' actual return values are
+    // untouched. (3) TravelTo() shows a small "Traveling..." toast for as long as that load
+    // is still in flight (polling GetCurrentlyOpenCollection(), throttled and skipped while
+    // on "Loading" - an earlier version of this polled every frame with no such guard, which
+    // hit exactly the GetCurrentlyOpenCollection() cost described in (2) and was itself a
+    // worse hang than the one it was meant to cover for), so a slow load reads as "working",
+    // not "frozen".
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public class FastTravelPlugin : BaseUnityPlugin
     {
@@ -71,6 +84,7 @@ namespace BlakeManorFastTravel
         private const float MaxHeight = 820f;
         private const float ResizeHandleSize = 18f;
         private const float TravelTimeoutSeconds = 45f;
+        private const float TravelPollIntervalSeconds = 1f;
 
         private bool _menuOpen;
         private Vector2 _scrollPos;
@@ -90,6 +104,7 @@ namespace BlakeManorFastTravel
         private bool _traveling;
         private string _travelDestinationPath;
         private float _travelStartTime;
+        private float _lastTravelPollTime;
 
         private void Awake()
         {
@@ -135,15 +150,31 @@ namespace BlakeManorFastTravel
         // Clears _traveling once the world actually reflects the destination we asked for
         // (i.e. the load finished), or after TravelTimeoutSeconds regardless - a failsafe
         // so a toast can never get stuck on-screen forever if something else goes wrong.
+        //
+        // GetCurrentlyOpenCollection() logs a very expensive error (string-concatenating
+        // every one of the ~140 registered scene collection paths) whenever the active
+        // scene doesn't match any of them - which is exactly true for the entire time
+        // we're still on the intermediate "Loading" scene. An earlier version of this
+        // polled it every frame, which spammed that error at 60fps for the whole load -
+        // a worse hang than the one this toast was meant to cover for. Skip the call
+        // outright while still on "Loading", and throttle it the rest of the time; once a
+        // second is more than enough responsiveness for a UI toast.
         private void UpdateTravelingState()
         {
-            SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
-            if (current != null && current.Path == _travelDestinationPath)
+            if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
             {
                 _traveling = false;
                 return;
             }
-            if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
+            if (Time.unscaledTime - _lastTravelPollTime < TravelPollIntervalSeconds ||
+                SceneManager.GetActiveScene().name == "Loading")
+            {
+                return;
+            }
+            _lastTravelPollTime = Time.unscaledTime;
+
+            SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
+            if (current != null && current.Path == _travelDestinationPath)
             {
                 _traveling = false;
             }
@@ -495,6 +526,31 @@ namespace BlakeManorFastTravel
     // around it) - it doesn't change what the method computes or returns.
     [HarmonyPatch(typeof(MapArea), "GetTimeTableDataForLocationAndTime")]
     internal static class MapArea_GetTimeTableDataForLocationAndTime_SilenceLogSpam
+    {
+        private static bool _wasLogEnabled;
+
+        private static void Prefix()
+        {
+            _wasLogEnabled = Debug.unityLogger.logEnabled;
+            Debug.unityLogger.logEnabled = false;
+        }
+
+        private static void Postfix()
+        {
+            Debug.unityLogger.logEnabled = _wasLogEnabled;
+        }
+    }
+
+    // SceneCollectionsManager.GetCurrentlyOpenCollection() does the same expensive thing on
+    // a miss: it string-concatenates every registered scene collection's runtime scene
+    // names (~140 of them) into an error, which fires every time it's called while the
+    // active scene doesn't match any collection - true for the entire "Loading" screen.
+    // We throttle our own polling of this method (see UpdateTravelingState()), but this
+    // patches the method itself so it's silenced no matter who calls it, including the
+    // base game. Same as above: only logging is suppressed, the lookup/return value is
+    // untouched.
+    [HarmonyPatch(typeof(SpookyDoorway.SceneCollectionsManager), "GetCurrentlyOpenCollection")]
+    internal static class SceneCollectionsManager_GetCurrentlyOpenCollection_SilenceLogSpam
     {
         private static bool _wasLogEnabled;
 
