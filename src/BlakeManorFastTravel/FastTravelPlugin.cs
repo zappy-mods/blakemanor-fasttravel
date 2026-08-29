@@ -191,6 +191,16 @@ namespace BlakeManorFastTravel
         {
             if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
             {
+                // If this ever actually fires, it means the destination never became the
+                // open collection within 45s of a successful ChangeScene() call - i.e. a
+                // load that really did hang, not just run long. Worth a loud log line: this
+                // is the single strongest signal we have for diagnosing a stuck black
+                // screen after the fact, since nothing else here would otherwise record it.
+                Logger.LogWarning(
+                    $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' did not complete within " +
+                    $"{TravelTimeoutSeconds}s (still active scene: " +
+                    $"'{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}', " +
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Giving up on the toast.");
                 _traveling = false;
                 return;
             }
@@ -204,6 +214,7 @@ namespace BlakeManorFastTravel
             SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
             if (current != null && current.Path == _travelDestinationPath)
             {
+                Logger.LogInfo($"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after {Time.unscaledTime - _travelStartTime:0.0}s.");
                 _traveling = false;
             }
         }
@@ -591,6 +602,10 @@ namespace BlakeManorFastTravel
 
         private void TravelTo(EHSceneCollection destination)
         {
+            Logger.LogInfo(
+                $"[BlakeManorFastTravel] TravelTo requested: dest='{destination.Path}' handle='{destination.handle}' " +
+                $"IsLoading={KickStarter.sceneChanger?.IsLoading()} " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}'");
             try
             {
                 // EHSceneChanger.ChangeScene() opens with:
@@ -606,6 +621,7 @@ namespace BlakeManorFastTravel
                 // a clean, visible refusal instead of a silent half-transition.
                 if (KickStarter.sceneChanger != null && KickStarter.sceneChanger.IsLoading())
                 {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Refused travel to '{destination.Path}' - a scene change was already in progress.");
                     _statusMessage = "Still loading the last destination - try again in a moment.";
                     return;
                 }
@@ -652,6 +668,10 @@ namespace BlakeManorFastTravel
                     useLoadingMusic: KickStarter.settingsManager.useLoadingMusic,
                     loadingMusicID: KickStarter.settingsManager.loadingMusicID,
                     loopLoading: true);
+
+                Logger.LogInfo(
+                    $"[BlakeManorFastTravel] ChangeScene called for '{destination.Path}', now " +
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}");
 
                 _traveling = true;
                 _travelDestinationPath = destination.Path;
