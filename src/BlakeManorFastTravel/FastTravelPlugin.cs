@@ -8,7 +8,6 @@ using SpookyDoorway.EldritchHouse.Runtime.AC.UI.Journal.Map;
 using SpookyDoorway.EldritchHouse.Runtime.Tools;
 using UnityEngine;
 using UnityEngine.InputSystem;
-using UnityEngine.SceneManagement;
 
 namespace BlakeManorFastTravel
 {
@@ -167,7 +166,7 @@ namespace BlakeManorFastTravel
                 return;
             }
             if (Time.unscaledTime - _lastTravelPollTime < TravelPollIntervalSeconds ||
-                SceneManager.GetActiveScene().name == "Loading")
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "Loading")
             {
                 return;
             }
