@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using AC;
 using BepInEx;
 using HarmonyLib;
@@ -110,10 +111,31 @@ namespace BlakeManorFastTravel
         // of guessing. Remove once that table is filled in and verified.
         private bool _loggedKeyedHandleCandidates;
 
+        // DEV-ONLY diagnostic (see ScanForDoorLinksThrottled): periodically scans the
+        // currently-loaded scene's ActionLists for door-unlock+scene-change pairs and
+        // appends each one found to _doorLinksLogPath, so we can build an accurate
+        // DoorKeys->handle table by just walking around instead of guessing. Remove once
+        // that table is filled in and verified.
+        private const float DoorScanIntervalSeconds = 2f;
+        private float _lastDoorScanTime;
+        private readonly HashSet<int> _scannedActionListIds = new HashSet<int>();
+        private string _doorLinksLogPath;
+
         private void Awake()
         {
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
+
+            string pluginDir = Path.GetDirectoryName(typeof(FastTravelPlugin).Assembly.Location) ?? ".";
+            _doorLinksLogPath = Path.Combine(pluginDir, "door_links.log");
+            try
+            {
+                File.AppendAllText(_doorLinksLogPath, $"--- session started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---{Environment.NewLine}");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] Failed to open door_links.log: " + ex.Message);
+            }
         }
 
         private void OnDestroy()
@@ -127,6 +149,8 @@ namespace BlakeManorFastTravel
             {
                 UpdateTravelingState();
             }
+
+            ScanForDoorLinksThrottled();
 
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
@@ -327,6 +351,72 @@ namespace BlakeManorFastTravel
                 Logger.LogInfo($"[BlakeManorFastTravel]   handle='{entry.Key}' label='{entry.Value}'");
             }
             Logger.LogInfo("[BlakeManorFastTravel] End of handle dump.");
+        }
+
+        // DEV-ONLY: every DoorScanIntervalSeconds, scans every AC.ActionList currently
+        // loaded (regardless of which scene it's in) for ones containing both an
+        // ActionEHUnlockDoor and an ActionScene_EH - i.e. a door's full "check key, unlock,
+        // change scene" Interaction - and appends each key->destination-handle pairing
+        // found to _doorLinksLogPath. Doors only exist as live objects in whatever scene
+        // they're placed in, so this only ever sees doors in scenes that have actually
+        // loaded - it builds up the map as you walk/fast-travel around, not all at once.
+        // Already-scanned ActionLists are skipped on later passes so walking back through
+        // an area doesn't rewrite the same lines.
+        private void ScanForDoorLinksThrottled()
+        {
+            if (Time.unscaledTime - _lastDoorScanTime < DoorScanIntervalSeconds)
+            {
+                return;
+            }
+            _lastDoorScanTime = Time.unscaledTime;
+
+            AC.ActionList[] actionLists = UnityEngine.Object.FindObjectsByType<AC.ActionList>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+
+            foreach (AC.ActionList actionList in actionLists)
+            {
+                int id = actionList.GetInstanceID();
+                if (!_scannedActionListIds.Add(id))
+                {
+                    continue; // already scanned this one
+                }
+
+                ActionEHUnlockDoor unlockAction = null;
+                ActionScene_EH sceneAction = null;
+                foreach (AC.Action action in actionList.actions)
+                {
+                    if (action is ActionEHUnlockDoor u)
+                    {
+                        unlockAction = u;
+                    }
+                    else if (action is ActionScene_EH s)
+                    {
+                        sceneAction = s;
+                    }
+                }
+
+                if (unlockAction != null && sceneAction != null)
+                {
+                    LogDoorLink(actionList, unlockAction, sceneAction);
+                }
+            }
+        }
+
+        private void LogDoorLink(AC.ActionList actionList, ActionEHUnlockDoor unlockAction, ActionScene_EH sceneAction)
+        {
+            EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
+            string fromHandle = current?.handle ?? "unknown";
+            string line = $"[{DateTime.Now:HH:mm:ss}] key={unlockAction.key} fromRoom='{fromHandle}' destHandle='{sceneAction.sceneHandle}' actionList='{actionList.name}'";
+
+            Logger.LogInfo("[BlakeManorFastTravel] " + line);
+            try
+            {
+                File.AppendAllText(_doorLinksLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] Failed to write door_links.log: " + ex.Message);
+            }
         }
 
         private void OnGUI()
