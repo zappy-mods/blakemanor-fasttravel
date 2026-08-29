@@ -214,7 +214,15 @@ namespace BlakeManorFastTravel
             SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
             if (current != null && current.Path == _travelDestinationPath)
             {
-                Logger.LogInfo($"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after {Time.unscaledTime - _travelStartTime:0.0}s.");
+                // gameState is what actually gates player movement/animation throughout AC -
+                // logging it here lets us tell "scene loaded fine but player control never
+                // came back" (gameState stuck off Normal) apart from "scene itself never
+                // finished" (the timeout branch above), which look identical in-game but
+                // need different fixes.
+                Logger.LogInfo(
+                    $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after " +
+                    $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
+                    $"playerNull={KickStarter.player == null}");
                 _traveling = false;
             }
         }
