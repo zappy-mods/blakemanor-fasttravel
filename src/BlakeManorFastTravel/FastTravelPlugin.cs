@@ -17,9 +17,13 @@ namespace BlakeManorFastTravel
     // The game (Adventure Creator + a custom "scene slinger" layer) already tracks room
     // discovery via a per-room AC Global Variable named "room.<handle>": 0 = never seen,
     // 1 = merely spotted (e.g. via the paper map object - may still be locked), 2 = the
-    // player has actually physically loaded into that room at least once (set in
-    // EHSceneSettings.OnStart(), i.e. only after getting past any lock/requirement). We
-    // gate fast travel on 2 so it only offers places already reached the normal way.
+    // player has actually physically loaded into that room at least once (set
+    // unconditionally in EHSceneSettings.OnStart() whenever that scene starts, for *any*
+    // reason - a normal door, but equally a forced cutscene/vision/dream sequence sharing
+    // the same handle - so on its own this only ever means "this scene has started once",
+    // not "you got past whatever normally gates it"). We gate fast travel on 2 as a
+    // baseline, then narrow further with HasPassableChecks() - see the comment on
+    // _conditionChecksByHandle - for anything that's actually key- or time-gated.
     //
     // Caveat: this variable is keyed on the room's *handle*, and a single physical room
     // can be represented by several distinct SceneCollection assets (different
@@ -111,15 +115,43 @@ namespace BlakeManorFastTravel
         // of guessing. Remove once that table is filled in and verified.
         private bool _loggedKeyedHandleCandidates;
 
-        // DEV-ONLY diagnostic (see ScanForDoorLinksThrottled): periodically scans the
-        // currently-loaded scene's ActionLists for door-unlock+scene-change pairs and
-        // appends each one found to _doorLinksLogPath, so we can build an accurate
-        // DoorKeys->handle table by just walking around instead of guessing. Remove once
-        // that table is filled in and verified.
+        // DEV-ONLY diagnostic (see ScanForDoorLinksThrottled) turned real mechanism: scans
+        // every AC.ActionList currently loaded for ones that also change scenes
+        // (ActionScene_EH), and caches every AC.ActionCheck-derived action found alongside
+        // it - an inventory check for a key door, an ActionEHCheckTime for something like
+        // the Dining Room's "closed outside of meal times" gate, or any other condition -
+        // keyed by destination handle. No hand-built key/handle table needed: whatever gets
+        // captured is authoritative by construction, since HasPassableChecks() calls the
+        // game's own CheckCondition() live rather than reimplementing what it means.
+        // Doors only exist as live objects in whatever scene they're placed in, so this
+        // only ever covers doors in scenes that have actually loaded - it fills in as you
+        // walk/fast-travel around, not all at once; anything not yet scanned just falls
+        // back to the plain room.<handle> >= 2 check, same as before this existed.
         private const float DoorScanIntervalSeconds = 2f;
         private float _lastDoorScanTime;
         private readonly HashSet<int> _scannedActionListIds = new HashSet<int>();
         private string _doorLinksLogPath;
+        private readonly Dictionary<string, List<AC.ActionCheck>> _conditionChecksByHandle = new Dictionary<string, List<AC.ActionCheck>>();
+
+        // Fails open (returns true) for a handle with no captured checks - nothing scanned
+        // there yet, or it genuinely has no extra condition - so this can only ever narrow
+        // what room.<handle> already allowed, never expand it or be the sole reason a
+        // legitimately-visited room becomes unreachable.
+        private bool HasPassableChecks(string handle)
+        {
+            if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> checks))
+            {
+                return true;
+            }
+            foreach (AC.ActionCheck check in checks)
+            {
+                if (check != null && !check.CheckCondition())
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
 
         private void Awake()
         {
@@ -317,6 +349,17 @@ namespace BlakeManorFastTravel
                     continue;
                 }
 
+                // Having been in a room once doesn't mean it's currently accessible the
+                // normal way: a corridor/room key you don't have (yet, or ever, in a given
+                // save) still gates entry, and a handful of rooms (the Dining Room) are only
+                // open during specific times regardless of visited state. Fails open for
+                // anything we don't have data on, so this can only narrow what room.<handle>
+                // already allowed, never expand it.
+                if (!HasPassableChecks(ehCollection.handle))
+                {
+                    continue;
+                }
+
                 if (!bestByHandle.TryGetValue(ehCollection.handle, out EHSceneCollection existing) ||
                     IsBetterVariantForToday(ehCollection, existing))
                 {
@@ -378,15 +421,20 @@ namespace BlakeManorFastTravel
             Logger.LogInfo("[BlakeManorFastTravel] End of handle dump.");
         }
 
-        // DEV-ONLY: every DoorScanIntervalSeconds, scans every AC.ActionList currently
-        // loaded (regardless of which scene it's in) for ones containing both an
-        // ActionEHUnlockDoor and an ActionScene_EH - i.e. a door's full "check key, unlock,
-        // change scene" Interaction - and appends each key->destination-handle pairing
-        // found to _doorLinksLogPath. Doors only exist as live objects in whatever scene
-        // they're placed in, so this only ever sees doors in scenes that have actually
-        // loaded - it builds up the map as you walk/fast-travel around, not all at once.
-        // Already-scanned ActionLists are skipped on later passes so walking back through
-        // an area doesn't rewrite the same lines.
+        // Every DoorScanIntervalSeconds, scans every AC.ActionList currently loaded
+        // (regardless of which scene it's in) for ones that also contain an ActionScene_EH
+        // - i.e. a door's Interaction. Any AC.ActionCheck-derived action found in the same
+        // list (an inventory check for a key door, an ActionEHCheckTime for a time-gated
+        // one, etc.) gets registered against that destination handle in
+        // _conditionChecksByHandle for HasPassableChecks() to call live later - see the
+        // comment on that field for why we don't need to know or hand-verify what kind of
+        // check it is. Also logs what it finds to _doorLinksLogPath, which is how we
+        // originally identified ActionEHCheckTime as the Dining Room's gate.
+        //
+        // Doors only exist as live objects in whatever scene they're placed in, so this
+        // only ever sees doors in scenes that have actually loaded - it builds up coverage
+        // as you walk/fast-travel around, not all at once. Already-scanned ActionLists are
+        // skipped on later passes so walking back through an area doesn't redo the work.
         private void ScanForDoorLinksThrottled()
         {
             if (Time.unscaledTime - _lastDoorScanTime < DoorScanIntervalSeconds)
@@ -406,65 +454,46 @@ namespace BlakeManorFastTravel
                     continue; // already scanned this one
                 }
 
-                ActionEHUnlockDoor unlockAction = null;
                 ActionScene_EH sceneAction = null;
+                List<AC.ActionCheck> checks = new List<AC.ActionCheck>();
                 foreach (AC.Action action in actionList.actions)
                 {
-                    if (action is ActionEHUnlockDoor u)
-                    {
-                        unlockAction = u;
-                    }
-                    else if (action is ActionScene_EH s)
+                    if (action is ActionScene_EH s)
                     {
                         sceneAction = s;
                     }
+                    else if (action is AC.ActionCheck check)
+                    {
+                        checks.Add(check);
+                    }
                 }
 
-                if (unlockAction != null && sceneAction != null)
+                if (sceneAction != null)
                 {
-                    LogDoorLink(actionList, unlockAction, sceneAction);
-                }
-                else if (sceneAction != null)
-                {
-                    // A scene-changing ActionList with no ActionEHUnlockDoor paired with it -
-                    // whatever gates this door (if anything), it isn't the key system. Log
-                    // every action type present so we can see what condition/check actually
-                    // surrounds the scene change (e.g. a time/TickZone check for something
-                    // like the Dining Room's "closed outside of meal times" restriction).
-                    LogUnpairedSceneChange(actionList, sceneAction);
+                    RegisterDoorLink(actionList, sceneAction, checks);
                 }
             }
         }
 
-        private void LogUnpairedSceneChange(AC.ActionList actionList, ActionScene_EH sceneAction)
+        private void RegisterDoorLink(AC.ActionList actionList, ActionScene_EH sceneAction, List<AC.ActionCheck> checks)
         {
+            string handle = sceneAction.sceneHandle;
+            if (checks.Count > 0)
+            {
+                if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> existing))
+                {
+                    existing = new List<AC.ActionCheck>();
+                    _conditionChecksByHandle[handle] = existing;
+                }
+                existing.AddRange(checks);
+            }
+
             EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
             string fromHandle = current?.handle ?? "unknown";
-            List<string> actionTypeNames = new List<string>();
-            foreach (AC.Action action in actionList.actions)
-            {
-                actionTypeNames.Add(action?.GetType().Name ?? "null");
-            }
+            string checkTypeNames = checks.Count == 0 ? "none" : string.Join(", ", checks.ConvertAll(c => c.GetType().Name));
             string line =
-                $"[{DateTime.Now:HH:mm:ss}] UNPAIRED destHandle='{sceneAction.sceneHandle}' fromRoom='{fromHandle}' " +
-                $"actionList='{actionList.name}' actions=[{string.Join(", ", actionTypeNames)}]";
-
-            Logger.LogInfo("[BlakeManorFastTravel] " + line);
-            try
-            {
-                File.AppendAllText(_doorLinksLogPath, line + Environment.NewLine);
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] Failed to write door_links.log: " + ex.Message);
-            }
-        }
-
-        private void LogDoorLink(AC.ActionList actionList, ActionEHUnlockDoor unlockAction, ActionScene_EH sceneAction)
-        {
-            EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
-            string fromHandle = current?.handle ?? "unknown";
-            string line = $"[{DateTime.Now:HH:mm:ss}] key={unlockAction.key} fromRoom='{fromHandle}' destHandle='{sceneAction.sceneHandle}' actionList='{actionList.name}'";
+                $"[{DateTime.Now:HH:mm:ss}] destHandle='{handle}' fromRoom='{fromHandle}' " +
+                $"actionList='{actionList.name}' checks=[{checkTypeNames}]";
 
             Logger.LogInfo("[BlakeManorFastTravel] " + line);
             try
@@ -678,6 +707,16 @@ namespace BlakeManorFastTravel
                     currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count)
                 {
                     _statusMessage = "Can't fast travel there right now - try again after moving normally.";
+                    return;
+                }
+
+                // Same re-check pattern as above: GetDiscoveredDestinations() already
+                // filters on this, but a key/time condition can flip between menu-build and
+                // click (spend the key, or the clock ticks past meal time), so verify again
+                // right before actually loading.
+                if (!HasPassableChecks(destination.handle))
+                {
+                    _statusMessage = "Can't fast travel there right now - it's currently locked.";
                     return;
                 }
 
