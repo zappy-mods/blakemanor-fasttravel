@@ -858,24 +858,52 @@ namespace BlakeManorFastTravel
     // check (GetCurrentlyOpenCollection() matching the destination) sees success even when
     // the player is left stuck.
     //
-    // Fix: fall back to any PlayerStart present in the newly-loaded scene rather than
+    // Fix: fall back to a PlayerStart present in the newly-loaded scene rather than
     // returning null - the player may spawn at a not-quite-right spot instead of exactly
     // where a door would have placed them, but that beats a broken load every time.
+    //
+    // Scoped to __instance's own scene, not just "any PlayerStart currently loaded
+    // anywhere": this game keeps several scene layers loaded concurrently (and briefly
+    // overlapping during a transition), so an unscoped search can hand back a PlayerStart
+    // belonging to a *different* scene entirely - not null, so no crash, but physically
+    // nonsensical (e.g. inside unloaded/foreign geometry). That still passes our own "did
+    // the travel complete" check (the destination scene collection genuinely is current)
+    // while leaving the player stuck unable to move - same visible symptom as the null
+    // crash this patch was written for, just with the crash itself avoided.
     [HarmonyPatch(typeof(EHSceneSettings), "GetPlayerStart")]
     internal static class EHSceneSettings_GetPlayerStart_FallbackWhenUnresolved
     {
-        private static void Postfix(ref PlayerStart __result)
+        private static readonly BepInEx.Logging.ManualLogSource Log =
+            BepInEx.Logging.Logger.CreateLogSource(FastTravelPlugin.PluginName);
+
+        private static void Postfix(EHSceneSettings __instance, ref PlayerStart __result)
         {
             if (__result != null)
             {
                 return;
             }
 
-            PlayerStart[] anyPlayerStarts = UnityEngine.Object.FindObjectsByType<PlayerStart>(
+            UnityEngine.SceneManagement.Scene ownScene = __instance.gameObject.scene;
+            PlayerStart[] allPlayerStarts = UnityEngine.Object.FindObjectsByType<PlayerStart>(
                 FindObjectsInactive.Include, FindObjectsSortMode.None);
-            if (anyPlayerStarts.Length > 0)
+
+            foreach (PlayerStart candidate in allPlayerStarts)
             {
-                __result = anyPlayerStarts[0];
+                if (candidate.gameObject.scene == ownScene)
+                {
+                    __result = candidate;
+                    return;
+                }
+            }
+
+            // No scene-scoped match either - true last resort, logged since this spawn
+            // location is unverified and could still be wrong.
+            if (allPlayerStarts.Length > 0)
+            {
+                Log.LogWarning(
+                    $"[BlakeManorFastTravel] GetPlayerStart(): no PlayerStart found in scene '{ownScene.name}' - " +
+                    "falling back to one from a different scene, spawn position may be wrong.");
+                __result = allPlayerStarts[0];
             }
         }
     }
