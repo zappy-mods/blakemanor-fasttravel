@@ -64,9 +64,9 @@ namespace BlakeManorFastTravel
         private List<EHSceneCollection> _destinations = new List<EHSceneCollection>();
         private string _statusMessage = "";
 
-        // Top-left-anchored so resizing (via the bottom-right grip) only ever grows/shrinks
-        // to the right/down - the window doesn't jump around under the cursor while dragging.
-        // Re-centered on screen each time the menu is opened; size is kept across opens.
+        // Re-centered on screen each time the menu is opened, and kept centered as it's
+        // resized (grip drag grows/shrinks symmetrically about the center rather than
+        // anchoring the top-left); size is kept across opens.
         private Rect _windowRect = new Rect(0f, 0f, DefaultWidth, DefaultHeight);
         private bool _resizingWindow;
 
@@ -291,8 +291,11 @@ namespace BlakeManorFastTravel
             DrawResizeGrip();
         }
 
-        // Drag-to-resize from the bottom-right corner. _windowRect's top-left stays put,
-        // so this is just "grow/shrink width and height by however far the mouse moved".
+        // Drag-to-resize from the bottom-right corner, growing/shrinking symmetrically
+        // about the window's center so it never drifts off-center while resizing. The
+        // handle still tracks the mouse 1:1: since both edges move, width/height change by
+        // 2x the mouse delta, and x/y shift by half of whatever change actually applied
+        // (post-clamp) so the center stays put even right at the min/max size.
         private void HandleResize()
         {
             Event e = Event.current;
@@ -309,8 +312,12 @@ namespace BlakeManorFastTravel
             }
             else if (_resizingWindow && e.type == EventType.MouseDrag)
             {
-                _windowRect.width = Mathf.Clamp(_windowRect.width + e.delta.x, MinWidth, MaxWidth);
-                _windowRect.height = Mathf.Clamp(_windowRect.height + e.delta.y, MinHeight, MaxHeight);
+                float newWidth = Mathf.Clamp(_windowRect.width + e.delta.x * 2f, MinWidth, MaxWidth);
+                float newHeight = Mathf.Clamp(_windowRect.height + e.delta.y * 2f, MinHeight, MaxHeight);
+                _windowRect.x -= (newWidth - _windowRect.width) / 2f;
+                _windowRect.y -= (newHeight - _windowRect.height) / 2f;
+                _windowRect.width = newWidth;
+                _windowRect.height = newHeight;
                 e.Use();
             }
             else if (_resizingWindow && (e.type == EventType.MouseUp || e.rawType == EventType.MouseUp))
