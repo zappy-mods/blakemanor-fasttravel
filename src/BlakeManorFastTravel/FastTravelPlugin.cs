@@ -214,6 +214,12 @@ namespace BlakeManorFastTravel
 
             MenuTheme.EnsureBuilt();
 
+            // Text (and button sizing) scales with the window, using width as the driver -
+            // clamped to the same ratio range MinWidth/MaxWidth already imply, spelled out
+            // explicitly here so it stays correct if those constants ever change.
+            float scale = Mathf.Clamp(_windowRect.width / DefaultWidth, MinWidth / DefaultWidth, MaxWidth / DefaultWidth);
+            MenuTheme.ApplyScale(scale);
+
             // Dim the world behind the menu, same as the game's own popups do.
             GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), MenuTheme.Overlay);
 
@@ -251,7 +257,7 @@ namespace BlakeManorFastTravel
                 _scrollPos = GUILayout.BeginScrollView(_scrollPos);
                 foreach (EHSceneCollection destination in _destinations)
                 {
-                    if (GUILayout.Button(DisplayName(destination), MenuTheme.DestinationButton, GUILayout.Height(36)))
+                    if (GUILayout.Button(DisplayName(destination), MenuTheme.DestinationButton, GUILayout.Height(36f * scale)))
                     {
                         TravelTo(destination);
                         break;
@@ -273,7 +279,7 @@ namespace BlakeManorFastTravel
 
             GUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120), GUILayout.Height(30)))
+            if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120f * scale), GUILayout.Height(30f * scale)))
             {
                 CloseMenu();
             }
