@@ -191,6 +191,7 @@ namespace BlakeManorFastTravel
             }
 
             ScanForDoorLinksThrottled();
+            LogHeartbeatStateThrottled();
 
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
@@ -198,9 +199,31 @@ namespace BlakeManorFastTravel
                 return;
             }
 
+            bool shiftHeld = keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
+
             if (keyboard.f9Key.wasPressedThisFrame)
             {
-                if (_menuOpen)
+                if (shiftHeld)
+                {
+                    // Emergency escape hatch: several hangs we've hit leave gameState stuck
+                    // off Normal (which is also what TryOpenMenu() requires, on purpose, to
+                    // avoid popping the menu open mid-cutscene) - meaning plain F9 does
+                    // nothing and looks exactly like a full deadlock even when it isn't one.
+                    // Shift+F9 bypasses that gate specifically to get out of a stuck room,
+                    // rather than force-quitting. It does NOT bypass the IsLoading() check
+                    // in TravelTo() - that one guards against colliding with a load that's
+                    // still genuinely in progress, which forcing through would only make
+                    // worse, not better.
+                    if (_menuOpen)
+                    {
+                        CloseMenu();
+                    }
+                    else
+                    {
+                        ForceOpenMenu();
+                    }
+                }
+                else if (_menuOpen)
                 {
                     CloseMenu();
                 }
@@ -213,6 +236,30 @@ namespace BlakeManorFastTravel
             {
                 CloseMenu();
             }
+        }
+
+        // Periodic, always-on state snapshot (not tied to an in-flight travel) - gameState
+        // is what actually gates player movement/animation throughout AC, so a continuous
+        // trace of it (plus IsLoading/active scene/player-null) is the only way to catch
+        // "it got stuck on some non-Normal value and never came back" after the fact,
+        // regardless of whether a fast travel was even involved. Cheap: BepInEx's own
+        // Logger, not Unity's Debug.Log, and only once every HeartbeatIntervalSeconds.
+        private const float HeartbeatIntervalSeconds = 5f;
+        private float _lastHeartbeatTime;
+
+        private void LogHeartbeatStateThrottled()
+        {
+            if (Time.unscaledTime - _lastHeartbeatTime < HeartbeatIntervalSeconds)
+            {
+                return;
+            }
+            _lastHeartbeatTime = Time.unscaledTime;
+
+            Logger.LogInfo(
+                $"[BlakeManorFastTravel] heartbeat: gameState={KickStarter.stateHandler?.gameState} " +
+                $"IsLoading={KickStarter.sceneChanger?.IsLoading()} " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}' " +
+                $"playerNull={KickStarter.player == null}");
         }
 
         // Clears _traveling once the world actually reflects the destination we asked for
@@ -293,6 +340,31 @@ namespace BlakeManorFastTravel
             _menuOpen = true;
 
             // Re-center on screen, but keep whatever size the player last resized it to.
+            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
+            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        // Shift+F9's target: same as TryOpenMenu() but skips its gameState/IsLoading gates
+        // entirely - see the comment where this is called from Update(). Forces gameState
+        // to Normal (rather than reading/restoring whatever it currently is) since a stuck
+        // non-Normal value is the most likely reason this was needed in the first place;
+        // CloseMenu() will restore back to Normal on exit either way.
+        private void ForceOpenMenu()
+        {
+            Logger.LogWarning(
+                $"[BlakeManorFastTravel] Emergency menu open (Shift+F9): gameState was " +
+                $"{KickStarter.stateHandler?.gameState}, IsLoading={KickStarter.sceneChanger?.IsLoading()}, " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}'");
+
+            _destinations = GetDiscoveredDestinations();
+            _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
+            _previousGameState = GameState.Normal;
+            if (KickStarter.stateHandler != null)
+            {
+                KickStarter.stateHandler.gameState = GameState.Normal;
+            }
+            _menuOpen = true;
+
             _windowRect.x = (Screen.width - _windowRect.width) / 2f;
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
         }
