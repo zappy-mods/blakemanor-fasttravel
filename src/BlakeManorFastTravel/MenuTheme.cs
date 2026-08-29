@@ -34,6 +34,14 @@ namespace BlakeManorFastTravel
         private static readonly Color ScrollFill = new Color32(0x14, 0x0c, 0x10, 0xd9);
         public static readonly Color Alert = new Color32(0xc9, 0x6b, 0x4e, 0xff);
 
+        // Font sizes as authored at the window's default size - ApplyScale multiplies
+        // these, it never mutates them, so repeated resizes don't compound rounding error.
+        private const int TitleBaseSize = 24;
+        private const int SubtitleBaseSize = 13;
+        private const int BodyBaseSize = 14;
+        private const int DestinationButtonBaseSize = 15;
+        private const int CloseButtonBaseSize = 13;
+
         public static void EnsureBuilt()
         {
             if (Built)
@@ -115,6 +123,19 @@ namespace BlakeManorFastTravel
             CloseButton.normal.background = RoundedRect(48, 8, Color.clear, PanelBorder, 1);
             CloseButton.hover.background = RoundedRect(48, 8, new Color(1f, 1f, 1f, 0.05f), Gold, 1);
             CloseButton.active.background = CloseButton.hover.background;
+        }
+
+        // Re-applies font sizes each frame off the window's current/default size ratio, so
+        // text (and the buttons sized to fit it) grow and shrink smoothly as the player
+        // drags the resize grip. GUIStyle.fontSize is cheap to mutate - no texture rebuilds.
+        public static void ApplyScale(float scale)
+        {
+            Title.fontSize = Mathf.RoundToInt(TitleBaseSize * scale);
+            Subtitle.fontSize = Mathf.RoundToInt(SubtitleBaseSize * scale);
+            Body.fontSize = Mathf.RoundToInt(BodyBaseSize * scale);
+            Status.fontSize = Mathf.RoundToInt(BodyBaseSize * scale);
+            DestinationButton.fontSize = Mathf.RoundToInt(DestinationButtonBaseSize * scale);
+            CloseButton.fontSize = Mathf.RoundToInt(CloseButtonBaseSize * scale);
         }
 
         private static Font TryLoadSerifFont()

@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using AC;
 using BepInEx;
+using HarmonyLib;
 using SpookyDoorway.EldritchHouse.Runtime.AC;
+using SpookyDoorway.EldritchHouse.Runtime.AC.UI.Journal.Map;
 using SpookyDoorway.EldritchHouse.Runtime.Tools;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -20,17 +22,52 @@ namespace BlakeManorFastTravel
     //
     // Caveat: this variable is keyed on the room's *handle*, and a single physical room
     // can be represented by several distinct SceneCollection assets (different
-    // chapters/times-of-day/story states sharing one handle) - so "room.<handle> == 2"
-    // only proves *some* variant of that room was visited, not necessarily the specific
-    // variant a given menu entry points to. Fast traveling into an unvisited variant can
-    // load a scene whose state/prerequisites were never set up, which has crashed the game
-    // before. A stricter, crash-proof version of this check (tracking the exact visited
-    // SceneCollection rather than the shared handle) is available if that trade-off isn't
-    // wanted.
+    // chapters/times-of-day/story states sharing one handle). Fast travel should still
+    // work across those - e.g. having visited the Lobby on day 2 evening should let you
+    // fast travel there on day 3 morning - but it must land you in *today's* variant of
+    // the room, not the literal historical asset you happened to visit it through.
+    //
+    // The crash this used to hit: EHSceneChanger.LoadLevelASync indexes
+    // destination.generatedScenesLoadingGroup[(int)SceneAppearanceController.sceneState]
+    // with no bounds check. sceneState is a global, ever-advancing appearance/chapter
+    // index, and each SceneCollection asset's generatedScenesLoadingGroup list is only
+    // ever as long as the range of states that asset was authored to support. Handing it
+    // a stale asset (e.g. the day-2-evening Lobby, on day 3 morning) can index past the
+    // end of that list and hard-crash the game.
+    //
+    // GetDiscoveredDestinations() below fixes this at the source: it dedupes by handle
+    // and, among all assets sharing a handle, only offers ones where sceneState is
+    // actually in range for that asset's generatedScenesLoadingGroup, preferring
+    // whichever variant's TickZoneDay1/TickZoneDay2 matches the current day. TravelTo()
+    // also re-checks the bounds right before loading, so even if that selection is ever
+    // wrong we fail soft (a status message) instead of crashing.
     //
     // We reuse the exact scene-change call the game's own doors/debug menu use
     // (EHSceneChanger.ChangeScene) so loading, saving of room state, and player placement
     // in the destination scene all behave exactly like a normal room transition.
+    //
+    // A few more things this plugin does around that load, all because fast travel's direct
+    // cross-region jump exposed base-game rough edges that door-by-door movement mostly
+    // hides:
+    //
+    // (1) A Harmony patch silences MapArea.GetTimeTableDataForLocationAndTime()'s per-entry
+    // Debug.Log/Debug.LogWarning spam - that method is a synchronous, unbatched scan run
+    // once per journal map area on every scene change, and Unity's Debug.Log is expensive
+    // enough (stack-trace capture per call) that logging alone can make a multi-region jump
+    // look like a hang.
+    //
+    // (2) A second Harmony patch silences the same kind of spam in
+    // SceneCollectionsManager.GetCurrentlyOpenCollection(): on a miss it string-concatenates
+    // every registered scene collection's names (~140 of them) into an error, and it misses
+    // on every call made while the active scene is still the intermediate "Loading" scene.
+    //
+    // Both patches only suppress logging - the patched methods' actual return values are
+    // untouched. (3) TravelTo() shows a small "Traveling..." toast for as long as that load
+    // is still in flight (polling GetCurrentlyOpenCollection(), throttled and skipped while
+    // on "Loading" - an earlier version of this polled every frame with no such guard, which
+    // hit exactly the GetCurrentlyOpenCollection() cost described in (2) and was itself a
+    // worse hang than the one it was meant to cover for), so a slow load reads as "working",
+    // not "frozen".
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public class FastTravelPlugin : BaseUnityPlugin
     {
@@ -38,14 +75,54 @@ namespace BlakeManorFastTravel
         public const string PluginName = "Blake Manor Fast Travel";
         public const string PluginVersion = "1.0.0";
 
+        private const float DefaultWidth = 440f;
+        private const float DefaultHeight = 520f;
+        private const float MinWidth = 320f;
+        private const float MinHeight = 300f;
+        private const float MaxWidth = 900f;
+        private const float MaxHeight = 820f;
+        private const float ResizeHandleSize = 18f;
+        private const float TravelTimeoutSeconds = 45f;
+        private const float TravelPollIntervalSeconds = 1f;
+
         private bool _menuOpen;
         private Vector2 _scrollPos;
         private GameState _previousGameState = GameState.Normal;
         private List<EHSceneCollection> _destinations = new List<EHSceneCollection>();
         private string _statusMessage = "";
+        private Harmony _harmony;
+
+        // Re-centered on screen each time the menu is opened, and kept centered as it's
+        // resized (grip drag grows/shrinks symmetrically about the center rather than
+        // anchoring the top-left); size is kept across opens.
+        private Rect _windowRect = new Rect(0f, 0f, DefaultWidth, DefaultHeight);
+        private bool _resizingWindow;
+
+        // Tracks an in-flight fast travel so OnGUI can show a "Traveling..." toast for as
+        // long as it's still loading - see UpdateTravelingState().
+        private bool _traveling;
+        private string _travelDestinationPath;
+        private float _travelStartTime;
+        private float _lastTravelPollTime;
+
+        private void Awake()
+        {
+            _harmony = new Harmony(PluginGuid);
+            _harmony.PatchAll();
+        }
+
+        private void OnDestroy()
+        {
+            _harmony?.UnpatchSelf();
+        }
 
         private void Update()
         {
+            if (_traveling)
+            {
+                UpdateTravelingState();
+            }
+
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
             {
@@ -69,6 +146,39 @@ namespace BlakeManorFastTravel
             }
         }
 
+        // Clears _traveling once the world actually reflects the destination we asked for
+        // (i.e. the load finished), or after TravelTimeoutSeconds regardless - a failsafe
+        // so a toast can never get stuck on-screen forever if something else goes wrong.
+        //
+        // GetCurrentlyOpenCollection() logs a very expensive error (string-concatenating
+        // every one of the ~140 registered scene collection paths) whenever the active
+        // scene doesn't match any of them - which is exactly true for the entire time
+        // we're still on the intermediate "Loading" scene. An earlier version of this
+        // polled it every frame, which spammed that error at 60fps for the whole load -
+        // a worse hang than the one this toast was meant to cover for. Skip the call
+        // outright while still on "Loading", and throttle it the rest of the time; once a
+        // second is more than enough responsiveness for a UI toast.
+        private void UpdateTravelingState()
+        {
+            if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
+            {
+                _traveling = false;
+                return;
+            }
+            if (Time.unscaledTime - _lastTravelPollTime < TravelPollIntervalSeconds ||
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "Loading")
+            {
+                return;
+            }
+            _lastTravelPollTime = Time.unscaledTime;
+
+            SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
+            if (current != null && current.Path == _travelDestinationPath)
+            {
+                _traveling = false;
+            }
+        }
+
         private void TryOpenMenu()
         {
             if (KickStarter.stateHandler == null || KickStarter.sceneChanger == null || KickStarter.settingsManager == null)
@@ -87,6 +197,10 @@ namespace BlakeManorFastTravel
             _previousGameState = KickStarter.stateHandler.gameState;
             KickStarter.stateHandler.gameState = GameState.Paused;
             _menuOpen = true;
+
+            // Re-center on screen, but keep whatever size the player last resized it to.
+            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
+            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
         }
 
         private void CloseMenu()
@@ -100,15 +214,18 @@ namespace BlakeManorFastTravel
 
         private List<EHSceneCollection> GetDiscoveredDestinations()
         {
-            List<EHSceneCollection> list = new List<EHSceneCollection>();
-
             SpookyDoorway.SceneCollectionsManager manager = EHKickStarter.SceneCollectionsManager;
             if (manager == null || manager.Collections == null)
             {
-                return list;
+                return new List<EHSceneCollection>();
             }
 
             SpookyDoorway.SceneCollection current = manager.GetCurrentlyOpenCollection();
+            int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
+
+            // One entry per handle - among all assets sharing a handle, keep only the
+            // best candidate for "today's" version of that room.
+            Dictionary<string, EHSceneCollection> bestByHandle = new Dictionary<string, EHSceneCollection>();
 
             foreach (SpookyDoorway.SceneCollection collection in manager.Collections)
             {
@@ -134,11 +251,37 @@ namespace BlakeManorFastTravel
                     continue; // not yet actually visited by the player
                 }
 
-                list.Add(ehCollection);
+                // Skip anything that can't support today's global appearance state - this
+                // is the exact bounds check EHSceneChanger.LoadLevelASync itself omits
+                // before indexing generatedScenesLoadingGroup, so anything that fails it
+                // would crash on load.
+                if (currentAppearanceIndex < 0 ||
+                    currentAppearanceIndex >= ehCollection.generatedScenesLoadingGroup.Count)
+                {
+                    continue;
+                }
+
+                if (!bestByHandle.TryGetValue(ehCollection.handle, out EHSceneCollection existing) ||
+                    IsBetterVariantForToday(ehCollection, existing))
+                {
+                    bestByHandle[ehCollection.handle] = ehCollection;
+                }
             }
 
+            List<EHSceneCollection> list = new List<EHSceneCollection>(bestByHandle.Values);
             list.Sort((a, b) => string.Compare(DisplayName(a), DisplayName(b), StringComparison.OrdinalIgnoreCase));
             return list;
+        }
+
+        // Prefers whichever candidate's tick zone for the current day actually applies
+        // (i.e. isn't None) - a best-effort match for "the version of this room that's
+        // current right now", using the same day/tick-zone fields EHSceneChanger reads.
+        private static bool IsBetterVariantForToday(EHSceneCollection candidate, EHSceneCollection existing)
+        {
+            int currentDay = EHKickStarter.RuntimeTimeManager.ReturnCopyOfActiveBucket.day;
+            EHSceneCollection.TickZone candidateZone = currentDay > 1 ? candidate.TickZoneDay2 : candidate.TickZoneDay1;
+            EHSceneCollection.TickZone existingZone = currentDay > 1 ? existing.TickZoneDay2 : existing.TickZoneDay1;
+            return candidateZone != EHSceneCollection.TickZone.None && existingZone == EHSceneCollection.TickZone.None;
         }
 
         private static string DisplayName(EHSceneCollection collection)
@@ -148,22 +291,31 @@ namespace BlakeManorFastTravel
 
         private void OnGUI()
         {
+            MenuTheme.EnsureBuilt();
+
+            if (_traveling)
+            {
+                DrawTravelingToast();
+            }
+
             if (!_menuOpen)
             {
                 return;
             }
 
-            MenuTheme.EnsureBuilt();
+            // Text (and button sizing) scales with the window, using width as the driver -
+            // clamped to the same ratio range MinWidth/MaxWidth already imply, spelled out
+            // explicitly here so it stays correct if those constants ever change.
+            float scale = Mathf.Clamp(_windowRect.width / DefaultWidth, MinWidth / DefaultWidth, MaxWidth / DefaultWidth);
+            MenuTheme.ApplyScale(scale);
 
             // Dim the world behind the menu, same as the game's own popups do.
             GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), MenuTheme.Overlay);
 
-            const float w = 440f;
-            const float h = 520f;
-            Rect windowRect = new Rect((Screen.width - w) / 2f, (Screen.height - h) / 2f, w, h);
+            HandleResize();
 
-            GUI.Box(windowRect, GUIContent.none, MenuTheme.Panel);
-            GUILayout.BeginArea(windowRect);
+            GUI.Box(_windowRect, GUIContent.none, MenuTheme.Panel);
+            GUILayout.BeginArea(_windowRect);
             GUILayout.Space(18);
             GUILayout.Label("FAST TRAVEL", MenuTheme.Title);
             GUILayout.Space(4);
@@ -194,7 +346,7 @@ namespace BlakeManorFastTravel
                 _scrollPos = GUILayout.BeginScrollView(_scrollPos);
                 foreach (EHSceneCollection destination in _destinations)
                 {
-                    if (GUILayout.Button(DisplayName(destination), MenuTheme.DestinationButton, GUILayout.Height(36)))
+                    if (GUILayout.Button(DisplayName(destination), MenuTheme.DestinationButton, GUILayout.Height(36f * scale)))
                     {
                         TravelTo(destination);
                         break;
@@ -216,7 +368,7 @@ namespace BlakeManorFastTravel
 
             GUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120), GUILayout.Height(30)))
+            if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120f * scale), GUILayout.Height(30f * scale)))
             {
                 CloseMenu();
             }
@@ -224,12 +376,101 @@ namespace BlakeManorFastTravel
             GUILayout.EndHorizontal();
             GUILayout.Space(14);
             GUILayout.EndArea();
+
+            DrawResizeGrip();
+        }
+
+        // Drag-to-resize from the bottom-right corner, growing/shrinking symmetrically
+        // about the window's center so it never drifts off-center while resizing. The
+        // handle still tracks the mouse 1:1: since both edges move, width/height change by
+        // 2x the mouse delta, and x/y shift by half of whatever change actually applied
+        // (post-clamp) so the center stays put even right at the min/max size.
+        private void HandleResize()
+        {
+            Event e = Event.current;
+            Rect handleRect = new Rect(
+                _windowRect.xMax - ResizeHandleSize,
+                _windowRect.yMax - ResizeHandleSize,
+                ResizeHandleSize,
+                ResizeHandleSize);
+
+            if (e.type == EventType.MouseDown && e.button == 0 && handleRect.Contains(e.mousePosition))
+            {
+                _resizingWindow = true;
+                e.Use();
+            }
+            else if (_resizingWindow && e.type == EventType.MouseDrag)
+            {
+                float newWidth = Mathf.Clamp(_windowRect.width + e.delta.x * 2f, MinWidth, MaxWidth);
+                float newHeight = Mathf.Clamp(_windowRect.height + e.delta.y * 2f, MinHeight, MaxHeight);
+                _windowRect.x -= (newWidth - _windowRect.width) / 2f;
+                _windowRect.y -= (newHeight - _windowRect.height) / 2f;
+                _windowRect.width = newWidth;
+                _windowRect.height = newHeight;
+                e.Use();
+            }
+            else if (_resizingWindow && (e.type == EventType.MouseUp || e.rawType == EventType.MouseUp))
+            {
+                _resizingWindow = false;
+                e.Use();
+            }
+        }
+
+        // A small diagonal dot-grid in the corner, echoing the panel's gold rule line -
+        // just enough to read as "draggable" without looking like a modern OS widget.
+        private void DrawResizeGrip()
+        {
+            const float dot = 3f;
+            const float gap = 5f;
+            float baseX = _windowRect.xMax - 6f;
+            float baseY = _windowRect.yMax - 6f;
+            for (int row = 0; row < 3; row++)
+            {
+                for (int col = 0; col <= row; col++)
+                {
+                    float x = baseX - row * gap + col * gap;
+                    float y = baseY - row * gap;
+                    GUI.DrawTexture(new Rect(x, y, dot, dot), MenuTheme.Rule);
+                }
+            }
+        }
+
+        // A small always-on-top toast, independent of the main menu (which is already
+        // closed by the time this matters) - just enough to say "still working" during a
+        // load that might take a while, instead of leaving the screen looking frozen.
+        private void DrawTravelingToast()
+        {
+            const float w = 240f;
+            const float h = 46f;
+            Rect toastRect = new Rect((Screen.width - w) / 2f, 28f, w, h);
+            GUI.Box(toastRect, GUIContent.none, MenuTheme.Panel);
+            GUI.Label(toastRect, "Traveling" + TravelingDots(), MenuTheme.Subtitle);
+        }
+
+        private static string TravelingDots()
+        {
+            int count = 1 + Mathf.FloorToInt(Time.unscaledTime * 2f) % 3;
+            return new string('.', count);
         }
 
         private void TravelTo(EHSceneCollection destination)
         {
             try
             {
+                // Belt-and-suspenders re-check: GetDiscoveredDestinations() should only
+                // ever hand us an in-bounds destination, but re-verify right before the
+                // scene load actually happens (the source of truth this mirrors is
+                // EHSceneChanger.LoadLevelASync's generatedScenesLoadingGroup[index]
+                // lookup, which has no bounds check of its own and is what crashes the
+                // game if handed a stale/incompatible variant).
+                int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
+                if (currentAppearanceIndex < 0 ||
+                    currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count)
+                {
+                    _statusMessage = "Can't fast travel there right now - try again after moving normally.";
+                    return;
+                }
+
                 SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager.GetCurrentlyOpenCollection();
                 string unloadPath = current != null ? current.Path : string.Empty;
 
@@ -258,12 +499,69 @@ namespace BlakeManorFastTravel
                     useLoadingMusic: KickStarter.settingsManager.useLoadingMusic,
                     loadingMusicID: KickStarter.settingsManager.loadingMusicID,
                     loopLoading: true);
+
+                _traveling = true;
+                _travelDestinationPath = destination.Path;
+                _travelStartTime = Time.unscaledTime;
             }
             catch (Exception ex)
             {
                 _statusMessage = "Fast travel failed: " + ex.Message;
                 Debug.LogError("[BlakeManorFastTravel] Fast travel failed: " + ex);
             }
+        }
+    }
+
+    // MapArea.GetTimeTableDataForLocationAndTime() runs once per journal-map area on every
+    // scene change (fast-traveled or not) and, for every active-bucket timetable entry,
+    // unconditionally does 1-2 Debug.Log/Debug.LogWarning calls - including one warning
+    // per entry for every map area that structurally has no area data (e.g. closets), which
+    // can add up to a lot of log calls in one frame. Debug.Log in Unity captures a stack
+    // trace per call, which is slow enough that this logging alone can make an otherwise-
+    // ordinary scene load look like a freeze - most noticeably on fast travel's direct
+    // cross-region jumps, since door-by-door movement seems to warm/avoid this path.
+    //
+    // This only silences logging for the duration of that one method call (saved/restored
+    // around it) - it doesn't change what the method computes or returns.
+    [HarmonyPatch(typeof(MapArea), "GetTimeTableDataForLocationAndTime")]
+    internal static class MapArea_GetTimeTableDataForLocationAndTime_SilenceLogSpam
+    {
+        private static bool _wasLogEnabled;
+
+        private static void Prefix()
+        {
+            _wasLogEnabled = Debug.unityLogger.logEnabled;
+            Debug.unityLogger.logEnabled = false;
+        }
+
+        private static void Postfix()
+        {
+            Debug.unityLogger.logEnabled = _wasLogEnabled;
+        }
+    }
+
+    // SceneCollectionsManager.GetCurrentlyOpenCollection() does the same expensive thing on
+    // a miss: it string-concatenates every registered scene collection's runtime scene
+    // names (~140 of them) into an error, which fires every time it's called while the
+    // active scene doesn't match any collection - true for the entire "Loading" screen.
+    // We throttle our own polling of this method (see UpdateTravelingState()), but this
+    // patches the method itself so it's silenced no matter who calls it, including the
+    // base game. Same as above: only logging is suppressed, the lookup/return value is
+    // untouched.
+    [HarmonyPatch(typeof(SpookyDoorway.SceneCollectionsManager), "GetCurrentlyOpenCollection")]
+    internal static class SceneCollectionsManager_GetCurrentlyOpenCollection_SilenceLogSpam
+    {
+        private static bool _wasLogEnabled;
+
+        private static void Prefix()
+        {
+            _wasLogEnabled = Debug.unityLogger.logEnabled;
+            Debug.unityLogger.logEnabled = false;
+        }
+
+        private static void Postfix()
+        {
+            Debug.unityLogger.logEnabled = _wasLogEnabled;
         }
     }
 }
