@@ -745,4 +745,46 @@ namespace BlakeManorFastTravel
             Debug.unityLogger.logEnabled = _wasLogEnabled;
         }
     }
+
+    // The actual root cause of the black-screen-with-audio and player-frozen hangs we've
+    // hit fast-traveling into some rooms: EHSceneSettings.GetPlayerStart() falls back to
+    //     Debug.Log("Can't find any starter, return null");
+    //     return null;
+    // whenever none of a room's PlayerStart markers match wherever the player is arriving
+    // from - one of its match conditions is the exact SceneCollectionInfo.playerStart name,
+    // which our own TravelTo() always passes as null, and another is "previous scene", which
+    // fast travel can make anything (a real door only ever connects scenes actually wired
+    // together at design time, so this path is never exercised that way). The caller,
+    // AC.SceneSettings.OnStart(), then does playerStart.transform.position immediately after
+    // with NO null check:
+    //     LoadedPlayerStart = true;
+    //     LastLoadedPlayerStart = KickStarter.sceneChanger.GetStartPosition(playerStart.transform.position);
+    // - an unhandled NullReferenceException that silently aborts the rest of OnStart(),
+    // including (we believe) whatever re-enables player movement/animation, while whatever
+    // ran earlier in the method (ambience audio, etc.) already fired. Scene state itself
+    // still ends up fully loaded/current, which is why our own "did the travel complete"
+    // check (GetCurrentlyOpenCollection() matching the destination) sees success even when
+    // the player is left stuck.
+    //
+    // Fix: fall back to any PlayerStart present in the newly-loaded scene rather than
+    // returning null - the player may spawn at a not-quite-right spot instead of exactly
+    // where a door would have placed them, but that beats a broken load every time.
+    [HarmonyPatch(typeof(EHSceneSettings), "GetPlayerStart")]
+    internal static class EHSceneSettings_GetPlayerStart_FallbackWhenUnresolved
+    {
+        private static void Postfix(ref PlayerStart __result)
+        {
+            if (__result != null)
+            {
+                return;
+            }
+
+            PlayerStart[] anyPlayerStarts = UnityEngine.Object.FindObjectsByType<PlayerStart>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+            if (anyPlayerStarts.Length > 0)
+            {
+                __result = anyPlayerStarts[0];
+            }
+        }
+    }
 }
