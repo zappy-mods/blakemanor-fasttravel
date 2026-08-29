@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using AC;
 using BepInEx;
+using HarmonyLib;
 using SpookyDoorway.EldritchHouse.Runtime.AC;
+using SpookyDoorway.EldritchHouse.Runtime.AC.UI.Journal.Map;
 using SpookyDoorway.EldritchHouse.Runtime.Tools;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -43,6 +45,17 @@ namespace BlakeManorFastTravel
     // We reuse the exact scene-change call the game's own doors/debug menu use
     // (EHSceneChanger.ChangeScene) so loading, saving of room state, and player placement
     // in the destination scene all behave exactly like a normal room transition.
+    //
+    // Two more things this plugin does around that load, both because fast travel's direct
+    // cross-region jump exposed a base-game rough edge that door-by-door movement mostly
+    // hides: (1) a Harmony patch silences MapArea.GetTimeTableDataForLocationAndTime()'s
+    // per-entry Debug.Log/Debug.LogWarning spam - that method is a synchronous, unbatched
+    // scan run once per journal map area on every scene change, and Unity's Debug.Log is
+    // expensive enough (stack-trace capture per call) that logging alone can make a
+    // multi-region jump look like a hang. We only suppress logging - the method's actual
+    // return value/behavior is untouched. (2) TravelTo() shows a small "Traveling..." toast
+    // for as long as that load is still in flight, so a slow load reads as "working", not
+    // "frozen".
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public class FastTravelPlugin : BaseUnityPlugin
     {
@@ -57,12 +70,14 @@ namespace BlakeManorFastTravel
         private const float MaxWidth = 900f;
         private const float MaxHeight = 820f;
         private const float ResizeHandleSize = 18f;
+        private const float TravelTimeoutSeconds = 45f;
 
         private bool _menuOpen;
         private Vector2 _scrollPos;
         private GameState _previousGameState = GameState.Normal;
         private List<EHSceneCollection> _destinations = new List<EHSceneCollection>();
         private string _statusMessage = "";
+        private Harmony _harmony;
 
         // Re-centered on screen each time the menu is opened, and kept centered as it's
         // resized (grip drag grows/shrinks symmetrically about the center rather than
@@ -70,8 +85,30 @@ namespace BlakeManorFastTravel
         private Rect _windowRect = new Rect(0f, 0f, DefaultWidth, DefaultHeight);
         private bool _resizingWindow;
 
+        // Tracks an in-flight fast travel so OnGUI can show a "Traveling..." toast for as
+        // long as it's still loading - see UpdateTravelingState().
+        private bool _traveling;
+        private string _travelDestinationPath;
+        private float _travelStartTime;
+
+        private void Awake()
+        {
+            _harmony = new Harmony(PluginGuid);
+            _harmony.PatchAll();
+        }
+
+        private void OnDestroy()
+        {
+            _harmony?.UnpatchSelf();
+        }
+
         private void Update()
         {
+            if (_traveling)
+            {
+                UpdateTravelingState();
+            }
+
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
             {
@@ -92,6 +129,23 @@ namespace BlakeManorFastTravel
             else if (_menuOpen && keyboard.escapeKey.wasPressedThisFrame)
             {
                 CloseMenu();
+            }
+        }
+
+        // Clears _traveling once the world actually reflects the destination we asked for
+        // (i.e. the load finished), or after TravelTimeoutSeconds regardless - a failsafe
+        // so a toast can never get stuck on-screen forever if something else goes wrong.
+        private void UpdateTravelingState()
+        {
+            SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
+            if (current != null && current.Path == _travelDestinationPath)
+            {
+                _traveling = false;
+                return;
+            }
+            if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
+            {
+                _traveling = false;
             }
         }
 
@@ -207,12 +261,17 @@ namespace BlakeManorFastTravel
 
         private void OnGUI()
         {
+            MenuTheme.EnsureBuilt();
+
+            if (_traveling)
+            {
+                DrawTravelingToast();
+            }
+
             if (!_menuOpen)
             {
                 return;
             }
-
-            MenuTheme.EnsureBuilt();
 
             // Text (and button sizing) scales with the window, using width as the driver -
             // clamped to the same ratio range MinWidth/MaxWidth already imply, spelled out
@@ -346,6 +405,24 @@ namespace BlakeManorFastTravel
             }
         }
 
+        // A small always-on-top toast, independent of the main menu (which is already
+        // closed by the time this matters) - just enough to say "still working" during a
+        // load that might take a while, instead of leaving the screen looking frozen.
+        private void DrawTravelingToast()
+        {
+            const float w = 240f;
+            const float h = 46f;
+            Rect toastRect = new Rect((Screen.width - w) / 2f, 28f, w, h);
+            GUI.Box(toastRect, GUIContent.none, MenuTheme.Panel);
+            GUI.Label(toastRect, "Traveling" + TravelingDots(), MenuTheme.Subtitle);
+        }
+
+        private static string TravelingDots()
+        {
+            int count = 1 + Mathf.FloorToInt(Time.unscaledTime * 2f) % 3;
+            return new string('.', count);
+        }
+
         private void TravelTo(EHSceneCollection destination)
         {
             try
@@ -392,12 +469,44 @@ namespace BlakeManorFastTravel
                     useLoadingMusic: KickStarter.settingsManager.useLoadingMusic,
                     loadingMusicID: KickStarter.settingsManager.loadingMusicID,
                     loopLoading: true);
+
+                _traveling = true;
+                _travelDestinationPath = destination.Path;
+                _travelStartTime = Time.unscaledTime;
             }
             catch (Exception ex)
             {
                 _statusMessage = "Fast travel failed: " + ex.Message;
                 Debug.LogError("[BlakeManorFastTravel] Fast travel failed: " + ex);
             }
+        }
+    }
+
+    // MapArea.GetTimeTableDataForLocationAndTime() runs once per journal-map area on every
+    // scene change (fast-traveled or not) and, for every active-bucket timetable entry,
+    // unconditionally does 1-2 Debug.Log/Debug.LogWarning calls - including one warning
+    // per entry for every map area that structurally has no area data (e.g. closets), which
+    // can add up to a lot of log calls in one frame. Debug.Log in Unity captures a stack
+    // trace per call, which is slow enough that this logging alone can make an otherwise-
+    // ordinary scene load look like a freeze - most noticeably on fast travel's direct
+    // cross-region jumps, since door-by-door movement seems to warm/avoid this path.
+    //
+    // This only silences logging for the duration of that one method call (saved/restored
+    // around it) - it doesn't change what the method computes or returns.
+    [HarmonyPatch(typeof(MapArea), "GetTimeTableDataForLocationAndTime")]
+    internal static class MapArea_GetTimeTableDataForLocationAndTime_SilenceLogSpam
+    {
+        private static bool _wasLogEnabled;
+
+        private static void Prefix()
+        {
+            _wasLogEnabled = Debug.unityLogger.logEnabled;
+            Debug.unityLogger.logEnabled = false;
+        }
+
+        private static void Postfix()
+        {
+            Debug.unityLogger.logEnabled = _wasLogEnabled;
         }
     }
 }
