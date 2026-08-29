@@ -358,10 +358,17 @@ namespace BlakeManorFastTravel
 
             _destinations = GetDiscoveredDestinations();
             _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
+            // Paused, not Normal: Paused is what actually triggers AC's own menu-mode
+            // behavior (frees the mouse cursor, suspends first-person camera control while
+            // a UI is up) - the same state TryOpenMenu() uses normally. Setting Normal here
+            // was the bug: it left first-person camera-look still capturing the mouse
+            // (broken, since that's what got stuck) with no cursor for the menu at all.
+            // _previousGameState stays Normal, though, so CloseMenu() resolves to a working
+            // state on exit rather than back to whatever was actually stuck.
             _previousGameState = GameState.Normal;
             if (KickStarter.stateHandler != null)
             {
-                KickStarter.stateHandler.gameState = GameState.Normal;
+                KickStarter.stateHandler.gameState = GameState.Paused;
             }
             _menuOpen = true;
 
