@@ -18,6 +18,7 @@ namespace BlakeManorFastTravel
         public static GUIStyle Status;
         public static GUIStyle DestinationButton;
         public static GUIStyle CloseButton;
+        public static GUIStyle LockToggleOn;
         public static GUIStyle ScrollBackground;
         public static Texture2D Overlay;
         public static Texture2D Rule;
@@ -41,6 +42,7 @@ namespace BlakeManorFastTravel
         private const int BodyBaseSize = 14;
         private const int DestinationButtonBaseSize = 15;
         private const int CloseButtonBaseSize = 13;
+        private const int LockToggleBaseSize = 13;
 
         public static void EnsureBuilt()
         {
@@ -123,6 +125,19 @@ namespace BlakeManorFastTravel
             CloseButton.normal.background = RoundedRect(48, 8, Color.clear, PanelBorder, 1);
             CloseButton.hover.background = RoundedRect(48, 8, new Color(1f, 1f, 1f, 0.05f), Gold, 1);
             CloseButton.active.background = CloseButton.hover.background;
+
+            // Solid gold fill for an active/"on" toggle state - dark text for contrast
+            // against the bright fill, rather than the cream/gold text every other button
+            // here uses against a dark background.
+            LockToggleOn = new GUIStyle(CloseButton)
+            {
+                fontSize = 13
+            };
+            LockToggleOn.normal.textColor = PanelFill;
+            LockToggleOn.hover.textColor = PanelFill;
+            LockToggleOn.normal.background = RoundedRect(48, 8, Gold, PanelBorder, 1);
+            LockToggleOn.hover.background = RoundedRect(48, 8, Gold, Cream, 1);
+            LockToggleOn.active.background = LockToggleOn.hover.background;
         }
 
         // Re-applies font sizes each frame off the window's current/default size ratio, so
@@ -136,6 +151,7 @@ namespace BlakeManorFastTravel
             Status.fontSize = Mathf.RoundToInt(BodyBaseSize * scale);
             DestinationButton.fontSize = Mathf.RoundToInt(DestinationButtonBaseSize * scale);
             CloseButton.fontSize = Mathf.RoundToInt(CloseButtonBaseSize * scale);
+            LockToggleOn.fontSize = Mathf.RoundToInt(LockToggleBaseSize * scale);
         }
 
         private static Font TryLoadSerifFont()

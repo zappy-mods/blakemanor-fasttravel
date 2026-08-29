@@ -594,10 +594,11 @@ namespace BlakeManorFastTravel
             }
 
             GUILayout.BeginHorizontal();
-            // Reuses DestinationButton's filled/wine style for "on" and CloseButton's
-            // outline style for "off" rather than building a dedicated toggle style - the
-            // filled look already reads as "active" elsewhere in this menu.
-            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.DestinationButton : MenuTheme.CloseButton;
+            GUILayout.Space(20);
+            // Solid gold fill (LockToggleOn) reads as "active" when on; the dark wine fill
+            // every destination button uses reads as "off"/blending into the panel rather
+            // than a fully transparent background, which looked like an empty gap here.
+            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.LockToggleOn : MenuTheme.DestinationButton;
             if (GUILayout.Button(_ignoreAccessChecks ? "Locks: Ignored" : "Locks: Enforced", toggleStyle, GUILayout.Width(150f * scale), GUILayout.Height(30f * scale)))
             {
                 _ignoreAccessChecks = !_ignoreAccessChecks;
@@ -608,7 +609,7 @@ namespace BlakeManorFastTravel
             {
                 CloseMenu();
             }
-            GUILayout.FlexibleSpace();
+            GUILayout.Space(20);
             GUILayout.EndHorizontal();
             GUILayout.Space(14);
             GUILayout.EndArea();
