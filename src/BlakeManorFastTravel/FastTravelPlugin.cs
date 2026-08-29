@@ -97,6 +97,14 @@ namespace BlakeManorFastTravel
         private string _statusMessage = "";
         private Harmony _harmony;
 
+        // Menu toggle to bypass HasPassableChecks() (keys/time-of-day/etc.) - resets to off
+        // every launch, on purpose, so a forgotten toggle from last session can't surprise
+        // you. Deliberately does NOT touch the crash-safety checks (the appearance-index
+        // bounds check, or the IsLoading concurrency guard) - those stay mandatory no matter
+        // what, since skipping either is what used to crash/hang the game outright rather
+        // than just letting you somewhere the story wouldn't otherwise let you in yet.
+        private bool _ignoreAccessChecks;
+
         // Re-centered on screen each time the menu is opened, and kept centered as it's
         // resized (grip drag grows/shrinks symmetrically about the center rather than
         // anchoring the top-left); size is kept across opens.
@@ -354,8 +362,10 @@ namespace BlakeManorFastTravel
                 // save) still gates entry, and a handful of rooms (the Dining Room) are only
                 // open during specific times regardless of visited state. Fails open for
                 // anything we don't have data on, so this can only narrow what room.<handle>
-                // already allowed, never expand it.
-                if (!HasPassableChecks(ehCollection.handle))
+                // already allowed, never expand it. _ignoreAccessChecks (the menu toggle)
+                // skips this specific gate on purpose; it never touches the crash-safety
+                // checks above/below it.
+                if (!_ignoreAccessChecks && !HasPassableChecks(ehCollection.handle))
                 {
                     continue;
                 }
@@ -584,6 +594,15 @@ namespace BlakeManorFastTravel
             }
 
             GUILayout.BeginHorizontal();
+            // Reuses DestinationButton's filled/wine style for "on" and CloseButton's
+            // outline style for "off" rather than building a dedicated toggle style - the
+            // filled look already reads as "active" elsewhere in this menu.
+            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.DestinationButton : MenuTheme.CloseButton;
+            if (GUILayout.Button(_ignoreAccessChecks ? "Locks: Ignored" : "Locks: Enforced", toggleStyle, GUILayout.Width(150f * scale), GUILayout.Height(30f * scale)))
+            {
+                _ignoreAccessChecks = !_ignoreAccessChecks;
+                _destinations = GetDiscoveredDestinations();
+            }
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120f * scale), GUILayout.Height(30f * scale)))
             {
@@ -713,8 +732,8 @@ namespace BlakeManorFastTravel
                 // Same re-check pattern as above: GetDiscoveredDestinations() already
                 // filters on this, but a key/time condition can flip between menu-build and
                 // click (spend the key, or the clock ticks past meal time), so verify again
-                // right before actually loading.
-                if (!HasPassableChecks(destination.handle))
+                // right before actually loading. Also skipped by _ignoreAccessChecks.
+                if (!_ignoreAccessChecks && !HasPassableChecks(destination.handle))
                 {
                     _statusMessage = "Can't fast travel there right now - it's currently locked.";
                     return;
