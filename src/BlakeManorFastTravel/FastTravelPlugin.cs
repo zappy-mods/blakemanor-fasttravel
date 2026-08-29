@@ -594,22 +594,22 @@ namespace BlakeManorFastTravel
             }
 
             GUILayout.BeginHorizontal();
-            GUILayout.Space(20);
-            // Solid gold fill (LockToggleOn) means "locks are on" (enforced, the default);
-            // the dark wine fill every destination button uses means "off" (ignored),
-            // reading as blending into the panel rather than a fully transparent gap.
-            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.DestinationButton : MenuTheme.LockToggleOn;
-            if (GUILayout.Button(_ignoreAccessChecks ? "Locks: Ignored" : "Locks: Enforced", toggleStyle, GUILayout.Width(150f * scale), GUILayout.Height(30f * scale)))
+            GUILayout.FlexibleSpace();
+            // Solid gold fill (LockToggleOn) means bypass is on; the dark wine fill every
+            // destination button uses means it's off, reading as blending into the panel
+            // rather than a fully transparent gap.
+            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.LockToggleOn : MenuTheme.DestinationButton;
+            if (GUILayout.Button(_ignoreAccessChecks ? "Bypass Locks: Enabled" : "Bypass Locks: Disabled", toggleStyle, GUILayout.Width(190f * scale), GUILayout.Height(30f * scale)))
             {
                 _ignoreAccessChecks = !_ignoreAccessChecks;
                 _destinations = GetDiscoveredDestinations();
             }
-            GUILayout.FlexibleSpace();
+            GUILayout.Space(14f * scale);
             if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120f * scale), GUILayout.Height(30f * scale)))
             {
                 CloseMenu();
             }
-            GUILayout.Space(20);
+            GUILayout.FlexibleSpace();
             GUILayout.EndHorizontal();
             GUILayout.Space(14);
             GUILayout.EndArea();
