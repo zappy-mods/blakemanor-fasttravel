@@ -1,0 +1,74 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>BlakeManorFastTravel</AssemblyName>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GameDir>$BLAKEMANOR_GAME_DIR</GameDir>
+    <ManagedDir>$(GameDir)/The Seance of Blake Manor_Data/Managed</ManagedDir>
+    <BepInExCoreDir>$(GameDir)/BepInEx/core</BepInExCoreDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BepInEx / Harmony -->
+    <Reference Include="BepInEx">
+      <HintPath>$(BepInExCoreDir)/BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(BepInExCoreDir)/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Unity engine -->
+    <Reference Include="UnityEngine">
+      <HintPath>$(ManagedDir)/UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(ManagedDir)/UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>$(ManagedDir)/UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(ManagedDir)/UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.InputSystem">
+      <HintPath>$(ManagedDir)/Unity.InputSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(ManagedDir)/UnityEngine.TextRenderingModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Game / Adventure Creator assemblies -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(ManagedDir)/Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SpookyDoorway.AdventureCreator">
+      <HintPath>$(ManagedDir)/SpookyDoorway.AdventureCreator.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SpookyDoorway.EldritchHouse.AC">
+      <HintPath>$(ManagedDir)/SpookyDoorway.EldritchHouse.AC.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="EldritchHouse.Runtime">
+      <HintPath>$(ManagedDir)/EldritchHouse.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="com.spookydoorway.scene-slinger">
+      <HintPath>$(ManagedDir)/com.spookydoorway.scene-slinger.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
