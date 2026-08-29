@@ -105,6 +105,24 @@ namespace BlakeManorFastTravel
         private float _travelStartTime;
         private float _lastTravelPollTime;
 
+        // DEV-ONLY diagnostic (see LogKeyedHandleCandidatesOnce): true once we've logged
+        // real handle strings for anything that looks key-gated, so we can build an
+        // accurate DoorKeys->handle table instead of guessing. Remove once that table is
+        // filled in and verified.
+        private bool _loggedKeyedHandleCandidates;
+
+        // Substrings of EHDoorNotifications.DoorKeys names (DArcysRoomKey, ManagersQuartersKey,
+        // WomensDormKey, BasementEntranceKey, MaleDormKey, SouthWestCorridorKey,
+        // NorthWestCorridorKey, SouthEastCorridorKey, NorthEastCorridorKey, SaloonKey,
+        // BlakeResidenceKey, HazelsRoomKey) - used only to narrow the diagnostic dump below
+        // to plausibly-relevant handles instead of logging all ~140.
+        private static readonly string[] KeyedHandleNameHints =
+        {
+            "DArcy", "ManagersQuarters", "WomensDorm", "Basement", "MaleDorm", "MensDorm",
+            "SouthWestCorridor", "NorthWestCorridor", "SouthEastCorridor", "NorthEastCorridor",
+            "Saloon", "BlakeResidence", "Hazel"
+        };
+
         private void Awake()
         {
             _harmony = new Harmony(PluginGuid);
@@ -220,6 +238,8 @@ namespace BlakeManorFastTravel
                 return new List<EHSceneCollection>();
             }
 
+            LogKeyedHandleCandidatesOnce(manager);
+
             SpookyDoorway.SceneCollection current = manager.GetCurrentlyOpenCollection();
             int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
 
@@ -287,6 +307,49 @@ namespace BlakeManorFastTravel
         private static string DisplayName(EHSceneCollection collection)
         {
             return string.IsNullOrEmpty(collection.label) ? collection.Path : collection.label;
+        }
+
+        // DEV-ONLY: logs the real handle/label/path for every registered scene collection
+        // whose handle or label resembles one of the 12 named door keys (EHDoorNotifications.
+        // DoorKeys), via BepInEx's own Logger (cheap, one-shot - not Unity's Debug.Log, so
+        // none of the performance concerns elsewhere in this file apply). This exists only to
+        // get real handle strings for building an accurate DoorKeys->handle table instead of
+        // guessing off scene names seen in unrelated logs - remove once that table is filled
+        // in and verified against this output.
+        private void LogKeyedHandleCandidatesOnce(SpookyDoorway.SceneCollectionsManager manager)
+        {
+            if (_loggedKeyedHandleCandidates)
+            {
+                return;
+            }
+            _loggedKeyedHandleCandidates = true;
+
+            Logger.LogInfo("[BlakeManorFastTravel] Dumping scene collections whose handle/label looks key-gated:");
+            foreach (SpookyDoorway.SceneCollection collection in manager.Collections)
+            {
+                EHSceneCollection ehCollection = collection as EHSceneCollection;
+                if (ehCollection == null)
+                {
+                    continue;
+                }
+                string handle = ehCollection.handle ?? "";
+                string label = ehCollection.label ?? "";
+                bool matches = false;
+                foreach (string hint in KeyedHandleNameHints)
+                {
+                    if (handle.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        label.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (matches)
+                {
+                    Logger.LogInfo($"[BlakeManorFastTravel]   handle='{handle}' label='{label}' path='{ehCollection.Path}'");
+                }
+            }
+            Logger.LogInfo("[BlakeManorFastTravel] End of key-gated handle dump.");
         }
 
         private void OnGUI()
