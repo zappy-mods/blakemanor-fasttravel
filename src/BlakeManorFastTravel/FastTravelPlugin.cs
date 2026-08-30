@@ -199,31 +199,9 @@ namespace BlakeManorFastTravel
                 return;
             }
 
-            bool shiftHeld = keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
-
             if (keyboard.f9Key.wasPressedThisFrame)
             {
-                if (shiftHeld)
-                {
-                    // Emergency escape hatch: several hangs we've hit leave gameState stuck
-                    // off Normal (which is also what TryOpenMenu() requires, on purpose, to
-                    // avoid popping the menu open mid-cutscene) - meaning plain F9 does
-                    // nothing and looks exactly like a full deadlock even when it isn't one.
-                    // Shift+F9 bypasses that gate specifically to get out of a stuck room,
-                    // rather than force-quitting. It does NOT bypass the IsLoading() check
-                    // in TravelTo() - that one guards against colliding with a load that's
-                    // still genuinely in progress, which forcing through would only make
-                    // worse, not better.
-                    if (_menuOpen)
-                    {
-                        CloseMenu();
-                    }
-                    else
-                    {
-                        ForceOpenMenu();
-                    }
-                }
-                else if (_menuOpen)
+                if (_menuOpen)
                 {
                     CloseMenu();
                 }
@@ -311,24 +289,21 @@ namespace BlakeManorFastTravel
                     $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
                     $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
 
-                // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
-                // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
-                // shows the stuck action is an early step in a room's on-enter "OnStart"
-                // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
-                // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
-                // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
-                // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
+                // Root cause of the stuck-Cutscene/hung-ActionList hangs we used to hit here,
+                // caught via diagnostic logging during investigation: the stuck action was
+                // always an early step in a room's on-enter "OnStart" sequence (ActionFade,
+                // ActionFMODTriggerParameterChange, etc.) whose Run() deliberately defers to
+                // a later frame - and every hang's Player.log showed "Setting timescale to 1"
+                // only ever appearing as part of forced-shutdown cleanup, never mid-hang,
                 // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
                 // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a
                 // race between "cutscene starts" and "timescale resets to 1 after loading"
-                // would freeze it on frame one forever if it loses that race - explaining both
-                // the specific stuck actions we've seen and why this is intermittent (a race,
-                // not a deterministic bug) rather than affecting every room every time.
-                // Forcing it back to 1 here, once we've independently confirmed the load
-                // itself is done, is a safety net against that race - harmless when
-                // unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause
-                // anyway), and should un-stick this automatically without ever needing
-                // Shift+F9 if this theory is right.
+                // freezes it on frame one forever if it loses that race - explaining both the
+                // specific stuck actions seen and why it was intermittent (a race, not a
+                // deterministic bug) rather than affecting every room every time. Forcing it
+                // back to 1 here, once we've independently confirmed the load itself is done,
+                // is harmless when unnecessary (gameplay always wants timeScale=1 outside
+                // cutscenes/pause anyway) and has resolved every repro case we had.
                 if (Time.timeScale != 1f)
                 {
                     Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after travel completed - forcing back to 1.");
@@ -366,103 +341,6 @@ namespace BlakeManorFastTravel
             // Re-center on screen, but keep whatever size the player last resized it to.
             _windowRect.x = (Screen.width - _windowRect.width) / 2f;
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
-        }
-
-        // Shift+F9's target: same as TryOpenMenu() but skips its gameState/IsLoading gates
-        // entirely - see the comment where this is called from Update(). Forces gameState
-        // to Normal (rather than reading/restoring whatever it currently is) since a stuck
-        // non-Normal value is the most likely reason this was needed in the first place;
-        // CloseMenu() will restore back to Normal on exit either way.
-        private void ForceOpenMenu()
-        {
-            Logger.LogWarning(
-                $"[BlakeManorFastTravel] Emergency menu open (Shift+F9): gameState was " +
-                $"{KickStarter.stateHandler?.gameState}, IsLoading={KickStarter.sceneChanger?.IsLoading()}, " +
-                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}'");
-
-            _destinations = GetDiscoveredDestinations();
-            _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
-
-            // The actual mechanism behind the stuck-gameState hangs: heartbeat logging
-            // caught gameState stuck on Cutscene (not just "not Normal") for 20+ seconds
-            // straight - i.e. an EHSceneSettings on-enter cutscene that started but never
-            // finished, most likely because it's waiting on the player's position/a marker
-            // it expects that our fast-travel spawn point doesn't satisfy. Testing showed
-            // that just reassigning gameState (Normal, Paused, or a Normal->Paused pass-
-            // through) isn't enough on its own - the camera kept rotating toward a fixed
-            // direction regardless of mouse input, meaning the stuck cutscene's own
-            // face/look action was still actively running and re-applying itself every
-            // frame, independent of gameState. KillAllLists() (AC.ActionListManager) resets
-            // every currently-active ActionList, which is the actual fix: it force-stops
-            // whatever's still running, not just the state flag that was supposed to
-            // reflect it.
-            LogActiveActionLists();
-            try
-            {
-                AC.ActionListManager.KillAll();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
-            }
-
-            // Paused is what actually triggers AC's own menu-mode behavior (frees the mouse
-            // cursor, suspends first-person camera control while a UI is up) - the same
-            // state TryOpenMenu() uses normally. _previousGameState stays Normal so
-            // CloseMenu() resolves to a working state on exit regardless of what was stuck.
-            _previousGameState = GameState.Normal;
-            if (KickStarter.stateHandler != null)
-            {
-                KickStarter.stateHandler.gameState = GameState.Paused;
-            }
-            _menuOpen = true;
-
-            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
-            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
-        }
-
-        // Logs every currently-active ActionList/ActionListAsset and, for each one, every
-        // action it contains with its type name - and *which specific action* has
-        // AC.Action.isRunning set, since that's the exact one still mid-execution when we
-        // hit this. Called right before KillAllLists() so this is a snapshot of what we're
-        // about to force-stop - the isRunning-marked action is the actual culprit, not just
-        // "some cutscene somewhere".
-        private void LogActiveActionLists()
-        {
-            LogActiveListsFrom("scene", KickStarter.actionListManager?.activeLists);
-            LogActiveListsFrom("asset", KickStarter.actionListAssetManager?.activeLists);
-        }
-
-        private void LogActiveListsFrom(string kind, List<AC.ActiveList> lists)
-        {
-            if (lists == null || lists.Count == 0)
-            {
-                Logger.LogWarning($"[BlakeManorFastTravel] No active {kind} ActionLists.");
-                return;
-            }
-
-            foreach (AC.ActiveList activeList in lists)
-            {
-                string listName = activeList.actionList != null ? activeList.actionList.name
-                    : activeList.actionListAsset != null ? activeList.actionListAsset.name
-                    : "unknown";
-                List<AC.Action> actions = activeList.actionList != null ? activeList.actionList.actions
-                    : activeList.actionListAsset?.actions;
-
-                if (actions == null)
-                {
-                    Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': (no actions available)");
-                    continue;
-                }
-
-                List<string> actionDescriptions = new List<string>();
-                foreach (AC.Action action in actions)
-                {
-                    string marker = action != null && action.isRunning ? "*RUNNING*" : "";
-                    actionDescriptions.Add((action?.GetType().Name ?? "null") + marker);
-                }
-                Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': [{string.Join(", ", actionDescriptions)}]");
-            }
         }
 
         private void CloseMenu()
