@@ -88,7 +88,14 @@ namespace BlakeManorFastTravel
         private const float MaxWidth = 900f;
         private const float MaxHeight = 820f;
         private const float ResizeHandleSize = 18f;
-        private const float TravelTimeoutSeconds = 45f;
+        // The false positive this timeout exists to filter out (timeScale reading non-1 for
+        // a moment right as the destination becomes current, before the game's own normal
+        // completion sequence gets to resetting it) resolves within about a frame of real
+        // time - nowhere near multiple seconds. 6s/6 poll cycles gives that several times
+        // over as margin while still cutting the wait for a genuine hang down drastically
+        // from the original 45s pick (which was just a generic large safety margin, not
+        // tuned to an observed value).
+        private const float TravelTimeoutSeconds = 6f;
         private const float TravelPollIntervalSeconds = 1f;
 
         private bool _menuOpen;
