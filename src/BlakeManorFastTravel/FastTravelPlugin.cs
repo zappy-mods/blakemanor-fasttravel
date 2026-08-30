@@ -122,6 +122,7 @@ namespace BlakeManorFastTravel
         private string _travelDestinationPath;
         private float _travelStartTime;
         private float _lastTravelPollTime;
+        private bool _travelDestinationConfirmed;
 
         // Diagnostic-only, gated behind _diagnosticsConfig (see LogKeyedHandleCandidatesOnce):
         // true once we've logged every registered handle - useful for troubleshooting, not
@@ -302,16 +303,23 @@ namespace BlakeManorFastTravel
         {
             if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
             {
-                // If this ever actually fires, it means the destination never became the
-                // open collection within 45s of a successful ChangeScene() call - i.e. a
-                // load that really did hang, not just run long. Worth a loud log line: this
-                // is the single strongest signal we have for diagnosing a stuck black
-                // screen after the fact, since nothing else here would otherwise record it.
+                // Getting here means one of two genuinely-stuck cases, both worth a loud log
+                // line since nothing else would otherwise record it: either the destination
+                // never became the open collection at all within 45s (the load itself hung),
+                // or it did become current but Time.timeScale never came back to 1 in all that
+                // time (the on-enter-cutscene/timescale race below, but given a full 45s to
+                // resolve on its own first rather than judged off a single reading). Waiting
+                // out the whole timeout before escalating is deliberate: a single "timeScale
+                // != 1" reading taken the instant the destination becomes current turned out
+                // to be too eager a trigger (see below) and doesn't distinguish a genuine hang
+                // from a normal load that just hasn't finished its own cleanup yet.
                 Logger.LogWarning(
                     $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' did not complete within " +
-                    $"{TravelTimeoutSeconds}s (still active scene: " +
+                    $"{TravelTimeoutSeconds}s (destinationConfirmed={_travelDestinationConfirmed}, " +
+                    $"timeScale={Time.timeScale}, active scene: " +
                     $"'{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}', " +
-                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Giving up on the toast.");
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Escalating to full recovery.");
+                RecoverFromPossibleHang();
                 _traveling = false;
                 return;
             }
@@ -323,43 +331,54 @@ namespace BlakeManorFastTravel
             _lastTravelPollTime = Time.unscaledTime;
 
             SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
-            if (current != null && current.Path == _travelDestinationPath)
+            if (current == null || current.Path != _travelDestinationPath)
+            {
+                return;
+            }
+
+            if (!_travelDestinationConfirmed)
             {
                 // gameState is what actually gates player movement/animation throughout AC -
                 // logging it here lets us tell "scene loaded fine but player control never
                 // came back" (gameState stuck off Normal) apart from "scene itself never
                 // finished" (the timeout branch above), which look identical in-game but
-                // need different fixes.
+                // need different fixes. Logged once, on the poll where the destination first
+                // matches, rather than every poll thereafter while we wait on timeScale below.
                 Logger.LogInfo(
                     $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after " +
                     $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
                     $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
+                _travelDestinationConfirmed = true;
+            }
 
-                // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
-                // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
-                // shows the stuck action is an early step in a room's on-enter "OnStart"
-                // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
-                // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
-                // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
-                // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
-                // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
-                // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a
-                // race between "cutscene starts" and "timescale resets to 1 after loading"
-                // would freeze it on frame one forever if it loses that race - explaining both
-                // the specific stuck actions we've seen and why this is intermittent (a race,
-                // not a deterministic bug) rather than affecting every room every time.
-                // Only escalate to the full reset (KillAllLists/StopConversation/subsystem
-                // toggles) when Time.timeScale being stuck off 1 actually signals something
-                // is wrong - confirmed the reliable tell for this exact race. Calling it
-                // unconditionally on every clean travel turned out not to be harmless after
-                // all: it was resetting AC's input/interaction systems and stopping any
-                // brand-new conversation right as one started (e.g. opening a book moments
-                // after a totally healthy arrival), causing exactly the kind of input
-                // jank/half-working clicks that motivated making this conditional.
-                if (Time.timeScale != 1f)
-                {
-                    RecoverFromPossibleHang();
-                }
+            // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
+            // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
+            // shows the stuck action is an early step in a room's on-enter "OnStart"
+            // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
+            // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
+            // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
+            // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
+            // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
+            // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a race
+            // between "cutscene starts" and "timescale resets to 1 after loading" would
+            // freeze it on frame one forever if it loses that race - explaining both the
+            // specific stuck actions we've seen and why this is intermittent (a race, not a
+            // deterministic bug) rather than affecting every room every time.
+            //
+            // Still, timeScale often reads non-1 for a moment right as the destination
+            // becomes current simply because the game's own normal completion sequence
+            // hasn't gotten to resetting it yet - not because anything is actually stuck.
+            // Escalating to the full reset (KillAllLists/StopConversation/subsystem toggles)
+            // off that single reading turned out not to be harmless: it was resetting AC's
+            // input/interaction systems and stopping any brand-new conversation right as one
+            // started (e.g. opening a book moments after a totally healthy arrival), causing
+            // exactly the kind of input jank/half-working clicks that motivated this rework.
+            // So: keep polling (stay "traveling", no escalation) for as long as timeScale
+            // hasn't self-corrected, and only escalate once we hit the timeout branch above -
+            // giving a normal-but-slightly-delayed reset the full 45s to resolve on its own
+            // before we conclude it's a genuine hang.
+            if (Time.timeScale == 1f)
+            {
                 _traveling = false;
             }
         }
@@ -587,16 +606,20 @@ namespace BlakeManorFastTravel
             }
 
             // Reported symptom: the camera detaching/spinning after a plain F9 open+close,
-            // with no travel involved at all - so this needs the same recovery the
-            // emergency path gets, not just the travel-completion path. But only when
-            // Time.timeScale being stuck off 1 actually signals something's wrong -
-            // unconditionally resetting AC's input/interaction systems and stopping any
-            // conversation on *every* close turned out to interfere with legitimate
-            // gameplay that happened to follow shortly after (see the comment in
-            // UpdateTravelingState() for the same fix, and why it matters here too).
+            // with no travel involved at all. The full reset (KillAllLists/StopConversation/
+            // subsystem toggles) used to run here too whenever Time.timeScale looked stuck,
+            // but a single close is a one-shot event with no chance to wait and see whether
+            // that's a genuine hang or just momentary load-completion lag (unlike
+            // UpdateTravelingState(), which now waits out the full timeout before
+            // escalating) - and firing the full reset eagerly is exactly what caused
+            // brand-new conversations right after a clean close/travel to lose auto-advance.
+            // So this only does the cheap, side-effect-free part: nudge timeScale itself
+            // back to 1 if it's stuck. If something is actually wrong beyond that, Shift+F9
+            // (ForceOpenMenu(), a deliberate user action) still runs the full recovery.
             if (Time.timeScale != 1f)
             {
-                RecoverFromPossibleHang();
+                Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} on menu close - forcing back to 1.");
+                Time.timeScale = 1f;
             }
         }
 
@@ -1076,6 +1099,7 @@ namespace BlakeManorFastTravel
                 _traveling = true;
                 _travelDestinationPath = destination.Path;
                 _travelStartTime = Time.unscaledTime;
+                _travelDestinationConfirmed = false;
             }
             catch (Exception ex)
             {
