@@ -348,12 +348,18 @@ namespace BlakeManorFastTravel
                 // would freeze it on frame one forever if it loses that race - explaining both
                 // the specific stuck actions we've seen and why this is intermittent (a race,
                 // not a deterministic bug) rather than affecting every room every time.
-                // RecoverFromPossibleHang() covers that race (forcing timeScale back to 1)
-                // and, defensively, the same hung-ActionList/hung-conversation cases the
-                // emergency and normal-close paths handle - this is the original scenario
-                // that motivated building it, so it gets the full treatment, not just the
-                // timeScale piece. Harmless when unnecessary, same reasoning as those paths.
-                RecoverFromPossibleHang();
+                // Only escalate to the full reset (KillAllLists/StopConversation/subsystem
+                // toggles) when Time.timeScale being stuck off 1 actually signals something
+                // is wrong - confirmed the reliable tell for this exact race. Calling it
+                // unconditionally on every clean travel turned out not to be harmless after
+                // all: it was resetting AC's input/interaction systems and stopping any
+                // brand-new conversation right as one started (e.g. opening a book moments
+                // after a totally healthy arrival), causing exactly the kind of input
+                // jank/half-working clicks that motivated making this conditional.
+                if (Time.timeScale != 1f)
+                {
+                    RecoverFromPossibleHang();
+                }
                 _traveling = false;
             }
         }
@@ -420,15 +426,18 @@ namespace BlakeManorFastTravel
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
         }
 
-        // Shared by both the emergency (Shift+F9) and normal (F9/Esc/Close) menu-close
-        // paths - every stuck-camera/stuck-player report we've chased down turned out to
-        // need one of these three, and none of them are safe to assume only the emergency
-        // path can hit: gameState stuck off Normal is what originally motivated Shift+F9
-        // existing at all, but the *normal* open/close path can trip the exact same
-        // Time.timeScale race (confirmed: camera detaching/spinning after a plain F9
-        // open+close, no travel involved), and a hung PixelCrushers conversation (confirmed
-        // via a Library book interaction) is just as reachable through normal play as
-        // through a stuck emergency scenario.
+        // The full-strength reset: KillAllLists(), StopConversation(), re-enabling AC's
+        // subsystem toggles, and forcing FadeIn/timeScale. Always called unconditionally
+        // from ForceOpenMenu() (Shift+F9) - the player invoking that is itself the signal
+        // something's wrong. From the normal travel-completion and menu-close paths it's
+        // only called when Time.timeScale != 1f, which we've confirmed is a reliable tell
+        // for the underlying stuck-cutscene/dialogue race - NOT unconditionally: an earlier
+        // version ran this on every clean travel/close on the theory that it was harmless
+        // when unnecessary, but that turned out to be wrong specifically for
+        // StopConversation() and the subsystem toggles - resetting AC's input/interaction
+        // systems and killing any active conversation right as a brand-new, perfectly
+        // healthy one started (e.g. opening a book moments after a clean fast travel)
+        // produced jerky/half-working clicks. Gate on an actual detected problem instead.
         //
         // - KillAllLists() (AC.ActionListManager) force-stops any still-running AC
         //   ActionList/Cutscene - covers a stuck on-enter cutscene whose face/look action
@@ -437,13 +446,11 @@ namespace BlakeManorFastTravel
         //   conversations, a separate subsystem KillAllLists() doesn't touch - the game's
         //   own EHSceneChanger.ChangeScene() already calls this defensively before every
         //   scene change, so this mirrors an established pattern, not a guess.
+        // - The AC.StateHandler subsystem toggles and MainCamera.FadeIn(0f) cover cases
+        //   where killing the ActionList driving them doesn't undo the state it already
+        //   left behind (camera-look disabled, screen mid-fade).
         // - Forcing Time.timeScale back to 1 covers the race described on
         //   UpdateTravelingState()'s completion branch.
-        //
-        // All three are harmless when unnecessary - gameplay always wants a running
-        // ActionList to finish, no conversation active, and timeScale=1 outside a genuine
-        // cutscene/pause anyway - so running them defensively on every menu close costs
-        // nothing when nothing was actually stuck.
         private void RecoverFromPossibleHang()
         {
             // AC.StateHandler tracks camera/movement/cursor/input/interaction/menu/trigger/
@@ -581,10 +588,16 @@ namespace BlakeManorFastTravel
 
             // Reported symptom: the camera detaching/spinning after a plain F9 open+close,
             // with no travel involved at all - so this needs the same recovery the
-            // emergency path gets, not just the travel-completion path. See the comment on
-            // RecoverFromPossibleHang() for why all three of what it does are safe to run
-            // unconditionally here.
-            RecoverFromPossibleHang();
+            // emergency path gets, not just the travel-completion path. But only when
+            // Time.timeScale being stuck off 1 actually signals something's wrong -
+            // unconditionally resetting AC's input/interaction systems and stopping any
+            // conversation on *every* close turned out to interfere with legitimate
+            // gameplay that happened to follow shortly after (see the comment in
+            // UpdateTravelingState() for the same fix, and why it matters here too).
+            if (Time.timeScale != 1f)
+            {
+                RecoverFromPossibleHang();
+            }
         }
 
         private List<EHSceneCollection> GetDiscoveredDestinations()
