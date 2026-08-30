@@ -512,6 +512,24 @@ namespace BlakeManorFastTravel
                 }
             }
 
+            // gameState is what actually gates player movement/input/animation throughout AC
+            // (see TryOpenMenu()'s check on it) - entirely separate from the StateHandler
+            // subsystem flags just reset above. A stuck on-enter cutscene/ActionList leaves
+            // this at Cutscene, and killing the list below doesn't undo that: nothing else
+            // sets it back. Confirmed missing in practice - the automatic (non-Shift+F9) path
+            // used to leave gameState stuck at Cutscene even after everything else here ran,
+            // only actually clearing once the player opened and closed the emergency menu,
+            // which happens to reset it as a side effect (see CloseMenu()). Both callers of
+            // this method run before anything of ours has put up a menu of its own, so there's
+            // no legitimate Paused-for-our-own-UI state here to preserve - forcing back to
+            // Normal is safe and, per everything else in this method, idempotent when nothing
+            // was actually stuck.
+            if (KickStarter.stateHandler != null && KickStarter.stateHandler.gameState != GameState.Normal)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] gameState was {KickStarter.stateHandler.gameState} - forcing back to Normal.");
+                KickStarter.stateHandler.gameState = GameState.Normal;
+            }
+
             LogActiveActionLists();
             try
             {
