@@ -531,14 +531,7 @@ namespace BlakeManorFastTravel
             }
 
             LogActiveActionLists();
-            try
-            {
-                AC.ActionListManager.KillAll();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
-            }
+            SkipStuckActionLists();
 
             try
             {
@@ -588,6 +581,69 @@ namespace BlakeManorFastTravel
         {
             LogActiveListsFrom("scene", KickStarter.actionListManager?.activeLists);
             LogActiveListsFrom("asset", KickStarter.actionListAssetManager?.activeLists);
+        }
+
+        // Replaces the AC.ActionListManager.KillAll() this used to call. KillAll() doesn't
+        // just unstick the one frozen action - it drops every remaining step in that same
+        // list too, including legitimate later ones (var/inventory setup, chained
+        // ActionRunActionList calls, etc.) that would have run fine once the stuck action got
+        // past. Confirmed root cause of a real regression: killing a room's OnStart list
+        // partway through was truncating setup that later interactions (e.g. examining a book)
+        // depended on, breaking dialogue/interaction in that room even though the visible
+        // stuck-fade/frozen-camera symptom itself was gone.
+        //
+        // ActionList.Skip(startIndex) is AC's own built-in "skip cutscene" mechanic - the
+        // same one the game's own skip-cutscene button uses - and doesn't have that problem:
+        // it re-runs the list from its original start index calling each action's own Skip()
+        // override (e.g. ActionFade.Skip() jumps straight to the fade's end state) all the
+        // way through to the list's natural completion, rather than truncating it. Actions
+        // without a Skip() override fall back to Action.Skip() calling Run() - re-running an
+        // already-completed step like a var-set is idempotent by AC's own convention, since
+        // this is the exact path an official cutscene skip takes regardless of where the
+        // player currently is in the sequence when they trigger it.
+        //
+        // ActiveList itself also exposes a Skip(), but it's gated on an internal skip-queue
+        // flag (inSkipQueue) that a stuck list was never enqueued into, so calling it directly
+        // would silently no-op - going straight to the underlying ActionList.Skip() avoids
+        // that gate. Asset-based ActionLists aren't handled here: every hang caught so far has
+        // logged "No active asset ActionLists", so there's no observed case to fix, and
+        // replicating ActiveList.Skip()'s asset-list path (DestroyAssetList +
+        // AdvGame.SkipActionListAsset) blind isn't worth the risk without one to verify against.
+        private void SkipStuckActionLists()
+        {
+            List<AC.ActiveList> lists = KickStarter.actionListManager?.activeLists;
+            if (lists == null)
+            {
+                return;
+            }
+
+            foreach (AC.ActiveList activeList in lists)
+            {
+                if (activeList?.actionList == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Logger.LogWarning(
+                        $"[BlakeManorFastTravel] Skipping stuck scene ActionList '{activeList.actionList.name}' " +
+                        $"(from index {activeList.startIndex}) instead of killing it, so later steps still run.");
+                    activeList.actionList.Skip(activeList.startIndex);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Skip() on '{activeList.actionList.name}' failed: {ex.Message}");
+                }
+            }
+
+            List<AC.ActiveList> assetLists = KickStarter.actionListAssetManager?.activeLists;
+            if (assetLists != null && assetLists.Count > 0)
+            {
+                Logger.LogWarning(
+                    $"[BlakeManorFastTravel] {assetLists.Count} active asset ActionList(s) present during recovery " +
+                    "- not auto-skipped (never observed stuck in practice); flag for follow-up if this shows up.");
+            }
         }
 
         private void LogActiveListsFrom(string kind, List<AC.ActiveList> lists)
