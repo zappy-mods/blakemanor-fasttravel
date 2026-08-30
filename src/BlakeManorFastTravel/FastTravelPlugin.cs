@@ -446,6 +446,39 @@ namespace BlakeManorFastTravel
         // nothing when nothing was actually stuck.
         private void RecoverFromPossibleHang()
         {
+            // AC.StateHandler tracks camera/movement/cursor/input/interaction/menu/trigger/
+            // player as independent enable flags, entirely separate from gameState - an
+            // interrupted cutscene/dialogue that disabled one of these (e.g. SetCameraSystem
+            // (false), to lock out player look during a scripted beat) and never got to turn
+            // it back on would leave that specific system broken regardless of gameState
+            // being fine, which fits "camera detached/stuck" better than anything gameState-
+            // level explains. Only two of these expose a public getter (the rest are
+            // write-only from here), so this can't be fully diagnostic, but re-enabling all
+            // of them is safe and idempotent when nothing was actually stuck - same
+            // reasoning as everything else in this method.
+            if (KickStarter.stateHandler != null)
+            {
+                Logger.LogWarning(
+                    $"[BlakeManorFastTravel] Before re-enabling AC subsystems: MovementIsOff={KickStarter.stateHandler.MovementIsOff} " +
+                    $"CursorIsOff={KickStarter.stateHandler.GetCursorIsOff()}");
+                try
+                {
+                    KickStarter.stateHandler.SetACState(true);
+                    KickStarter.stateHandler.SetCameraSystem(true);
+                    KickStarter.stateHandler.SetMovementSystem(true);
+                    KickStarter.stateHandler.SetCursorSystem(true);
+                    KickStarter.stateHandler.SetInputSystem(true);
+                    KickStarter.stateHandler.SetInteractionSystem(true);
+                    KickStarter.stateHandler.SetMenuSystem(true);
+                    KickStarter.stateHandler.SetTriggerSystem(true);
+                    KickStarter.stateHandler.SetPlayerSystem(true);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning("[BlakeManorFastTravel] Re-enabling AC subsystems failed: " + ex.Message);
+                }
+            }
+
             LogActiveActionLists();
             try
             {
@@ -473,6 +506,24 @@ namespace BlakeManorFastTravel
             {
                 Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} - forcing back to 1.");
                 Time.timeScale = 1f;
+            }
+
+            // Covers the black-screen symptom specifically: AC.MainCamera.FadeIn/FadeOut
+            // manage a persistent alpha/fadeTimer directly on the camera component, entirely
+            // independent of whatever ActionList (e.g. ActionFade) started the fade -
+            // killing that list above stops the *logic* driving the fade, but doesn't reset
+            // the fade's own visual state. If it was killed mid-fade-to-black, the screen
+            // would otherwise stay stuck at that alpha forever with nothing left to bring it
+            // back. FadeIn(0f) forces it fully visible instantly - the exact same defensive
+            // call the base game's own EHSceneChanger.ChangeScene() uses when it detects a
+            // blocked traversal, not a guess.
+            try
+            {
+                KickStarter.mainCamera?.FadeIn(0f);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] FadeIn(0f) failed: " + ex.Message);
             }
         }
 
