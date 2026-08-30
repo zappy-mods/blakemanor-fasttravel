@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using AC;
 using BepInEx;
 using HarmonyLib;
@@ -16,9 +17,13 @@ namespace BlakeManorFastTravel
     // The game (Adventure Creator + a custom "scene slinger" layer) already tracks room
     // discovery via a per-room AC Global Variable named "room.<handle>": 0 = never seen,
     // 1 = merely spotted (e.g. via the paper map object - may still be locked), 2 = the
-    // player has actually physically loaded into that room at least once (set in
-    // EHSceneSettings.OnStart(), i.e. only after getting past any lock/requirement). We
-    // gate fast travel on 2 so it only offers places already reached the normal way.
+    // player has actually physically loaded into that room at least once (set
+    // unconditionally in EHSceneSettings.OnStart() whenever that scene starts, for *any*
+    // reason - a normal door, but equally a forced cutscene/vision/dream sequence sharing
+    // the same handle - so on its own this only ever means "this scene has started once",
+    // not "you got past whatever normally gates it"). We gate fast travel on 2 as a
+    // baseline, then narrow further with HasPassableChecks() - see the comment on
+    // _conditionChecksByHandle - for anything that's actually key- or time-gated.
     //
     // Caveat: this variable is keyed on the room's *handle*, and a single physical room
     // can be represented by several distinct SceneCollection assets (different
@@ -92,6 +97,14 @@ namespace BlakeManorFastTravel
         private string _statusMessage = "";
         private Harmony _harmony;
 
+        // Menu toggle to bypass HasPassableChecks() (keys/time-of-day/etc.) - resets to off
+        // every launch, on purpose, so a forgotten toggle from last session can't surprise
+        // you. Deliberately does NOT touch the crash-safety checks (the appearance-index
+        // bounds check, or the IsLoading concurrency guard) - those stay mandatory no matter
+        // what, since skipping either is what used to crash/hang the game outright rather
+        // than just letting you somewhere the story wouldn't otherwise let you in yet.
+        private bool _ignoreAccessChecks;
+
         // Re-centered on screen each time the menu is opened, and kept centered as it's
         // resized (grip drag grows/shrinks symmetrically about the center rather than
         // anchoring the top-left); size is kept across opens.
@@ -105,10 +118,64 @@ namespace BlakeManorFastTravel
         private float _travelStartTime;
         private float _lastTravelPollTime;
 
+        // DEV-ONLY diagnostic (see LogKeyedHandleCandidatesOnce): true once we've logged
+        // real handle strings, so we can build an accurate DoorKeys->handle table instead
+        // of guessing. Remove once that table is filled in and verified.
+        private bool _loggedKeyedHandleCandidates;
+
+        // DEV-ONLY diagnostic (see ScanForDoorLinksThrottled) turned real mechanism: scans
+        // every AC.ActionList currently loaded for ones that also change scenes
+        // (ActionScene_EH), and caches every AC.ActionCheck-derived action found alongside
+        // it - an inventory check for a key door, an ActionEHCheckTime for something like
+        // the Dining Room's "closed outside of meal times" gate, or any other condition -
+        // keyed by destination handle. No hand-built key/handle table needed: whatever gets
+        // captured is authoritative by construction, since HasPassableChecks() calls the
+        // game's own CheckCondition() live rather than reimplementing what it means.
+        // Doors only exist as live objects in whatever scene they're placed in, so this
+        // only ever covers doors in scenes that have actually loaded - it fills in as you
+        // walk/fast-travel around, not all at once; anything not yet scanned just falls
+        // back to the plain room.<handle> >= 2 check, same as before this existed.
+        private const float DoorScanIntervalSeconds = 2f;
+        private float _lastDoorScanTime;
+        private readonly HashSet<int> _scannedActionListIds = new HashSet<int>();
+        private string _doorLinksLogPath;
+        private readonly Dictionary<string, List<AC.ActionCheck>> _conditionChecksByHandle = new Dictionary<string, List<AC.ActionCheck>>();
+
+        // Fails open (returns true) for a handle with no captured checks - nothing scanned
+        // there yet, or it genuinely has no extra condition - so this can only ever narrow
+        // what room.<handle> already allowed, never expand it or be the sole reason a
+        // legitimately-visited room becomes unreachable.
+        private bool HasPassableChecks(string handle)
+        {
+            if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> checks))
+            {
+                return true;
+            }
+            foreach (AC.ActionCheck check in checks)
+            {
+                if (check != null && !check.CheckCondition())
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         private void Awake()
         {
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
+
+            string pluginDir = Path.GetDirectoryName(typeof(FastTravelPlugin).Assembly.Location) ?? ".";
+            _doorLinksLogPath = Path.Combine(pluginDir, "door_links.log");
+            try
+            {
+                File.AppendAllText(_doorLinksLogPath, $"--- session started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---{Environment.NewLine}");
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] Failed to open door_links.log: " + ex.Message);
+            }
         }
 
         private void OnDestroy()
@@ -123,15 +190,40 @@ namespace BlakeManorFastTravel
                 UpdateTravelingState();
             }
 
+            ScanForDoorLinksThrottled();
+            LogHeartbeatStateThrottled();
+
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
             {
                 return;
             }
 
+            bool shiftHeld = keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
+
             if (keyboard.f9Key.wasPressedThisFrame)
             {
-                if (_menuOpen)
+                if (shiftHeld)
+                {
+                    // Emergency escape hatch: several hangs we've hit leave gameState stuck
+                    // off Normal (which is also what TryOpenMenu() requires, on purpose, to
+                    // avoid popping the menu open mid-cutscene) - meaning plain F9 does
+                    // nothing and looks exactly like a full deadlock even when it isn't one.
+                    // Shift+F9 bypasses that gate specifically to get out of a stuck room,
+                    // rather than force-quitting. It does NOT bypass the IsLoading() check
+                    // in TravelTo() - that one guards against colliding with a load that's
+                    // still genuinely in progress, which forcing through would only make
+                    // worse, not better.
+                    if (_menuOpen)
+                    {
+                        CloseMenu();
+                    }
+                    else
+                    {
+                        ForceOpenMenu();
+                    }
+                }
+                else if (_menuOpen)
                 {
                     CloseMenu();
                 }
@@ -144,6 +236,30 @@ namespace BlakeManorFastTravel
             {
                 CloseMenu();
             }
+        }
+
+        // Periodic, always-on state snapshot (not tied to an in-flight travel) - gameState
+        // is what actually gates player movement/animation throughout AC, so a continuous
+        // trace of it (plus IsLoading/active scene/player-null) is the only way to catch
+        // "it got stuck on some non-Normal value and never came back" after the fact,
+        // regardless of whether a fast travel was even involved. Cheap: BepInEx's own
+        // Logger, not Unity's Debug.Log, and only once every HeartbeatIntervalSeconds.
+        private const float HeartbeatIntervalSeconds = 5f;
+        private float _lastHeartbeatTime;
+
+        private void LogHeartbeatStateThrottled()
+        {
+            if (Time.unscaledTime - _lastHeartbeatTime < HeartbeatIntervalSeconds)
+            {
+                return;
+            }
+            _lastHeartbeatTime = Time.unscaledTime;
+
+            Logger.LogInfo(
+                $"[BlakeManorFastTravel] heartbeat: gameState={KickStarter.stateHandler?.gameState} " +
+                $"IsLoading={KickStarter.sceneChanger?.IsLoading()} " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}' " +
+                $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
         }
 
         // Clears _traveling once the world actually reflects the destination we asked for
@@ -162,6 +278,16 @@ namespace BlakeManorFastTravel
         {
             if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
             {
+                // If this ever actually fires, it means the destination never became the
+                // open collection within 45s of a successful ChangeScene() call - i.e. a
+                // load that really did hang, not just run long. Worth a loud log line: this
+                // is the single strongest signal we have for diagnosing a stuck black
+                // screen after the fact, since nothing else here would otherwise record it.
+                Logger.LogWarning(
+                    $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' did not complete within " +
+                    $"{TravelTimeoutSeconds}s (still active scene: " +
+                    $"'{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}', " +
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Giving up on the toast.");
                 _traveling = false;
                 return;
             }
@@ -175,6 +301,39 @@ namespace BlakeManorFastTravel
             SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
             if (current != null && current.Path == _travelDestinationPath)
             {
+                // gameState is what actually gates player movement/animation throughout AC -
+                // logging it here lets us tell "scene loaded fine but player control never
+                // came back" (gameState stuck off Normal) apart from "scene itself never
+                // finished" (the timeout branch above), which look identical in-game but
+                // need different fixes.
+                Logger.LogInfo(
+                    $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after " +
+                    $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
+                    $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
+
+                // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
+                // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
+                // shows the stuck action is an early step in a room's on-enter "OnStart"
+                // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
+                // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
+                // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
+                // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
+                // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
+                // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a
+                // race between "cutscene starts" and "timescale resets to 1 after loading"
+                // would freeze it on frame one forever if it loses that race - explaining both
+                // the specific stuck actions we've seen and why this is intermittent (a race,
+                // not a deterministic bug) rather than affecting every room every time.
+                // Forcing it back to 1 here, once we've independently confirmed the load
+                // itself is done, is a safety net against that race - harmless when
+                // unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause
+                // anyway), and should un-stick this automatically without ever needing
+                // Shift+F9 if this theory is right.
+                if (Time.timeScale != 1f)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after travel completed - forcing back to 1.");
+                    Time.timeScale = 1f;
+                }
                 _traveling = false;
             }
         }
@@ -191,6 +350,12 @@ namespace BlakeManorFastTravel
                 // Don't pop the menu open mid-cutscene/dialogue/etc.
                 return;
             }
+            if (KickStarter.sceneChanger.IsLoading())
+            {
+                // Don't let a second fast travel get queued up while one is still loading -
+                // see the comment on the same check in TravelTo() for why that matters.
+                return;
+            }
 
             _destinations = GetDiscoveredDestinations();
             _statusMessage = "";
@@ -201,6 +366,103 @@ namespace BlakeManorFastTravel
             // Re-center on screen, but keep whatever size the player last resized it to.
             _windowRect.x = (Screen.width - _windowRect.width) / 2f;
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        // Shift+F9's target: same as TryOpenMenu() but skips its gameState/IsLoading gates
+        // entirely - see the comment where this is called from Update(). Forces gameState
+        // to Normal (rather than reading/restoring whatever it currently is) since a stuck
+        // non-Normal value is the most likely reason this was needed in the first place;
+        // CloseMenu() will restore back to Normal on exit either way.
+        private void ForceOpenMenu()
+        {
+            Logger.LogWarning(
+                $"[BlakeManorFastTravel] Emergency menu open (Shift+F9): gameState was " +
+                $"{KickStarter.stateHandler?.gameState}, IsLoading={KickStarter.sceneChanger?.IsLoading()}, " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}'");
+
+            _destinations = GetDiscoveredDestinations();
+            _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
+
+            // The actual mechanism behind the stuck-gameState hangs: heartbeat logging
+            // caught gameState stuck on Cutscene (not just "not Normal") for 20+ seconds
+            // straight - i.e. an EHSceneSettings on-enter cutscene that started but never
+            // finished, most likely because it's waiting on the player's position/a marker
+            // it expects that our fast-travel spawn point doesn't satisfy. Testing showed
+            // that just reassigning gameState (Normal, Paused, or a Normal->Paused pass-
+            // through) isn't enough on its own - the camera kept rotating toward a fixed
+            // direction regardless of mouse input, meaning the stuck cutscene's own
+            // face/look action was still actively running and re-applying itself every
+            // frame, independent of gameState. KillAllLists() (AC.ActionListManager) resets
+            // every currently-active ActionList, which is the actual fix: it force-stops
+            // whatever's still running, not just the state flag that was supposed to
+            // reflect it.
+            LogActiveActionLists();
+            try
+            {
+                AC.ActionListManager.KillAll();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
+            }
+
+            // Paused is what actually triggers AC's own menu-mode behavior (frees the mouse
+            // cursor, suspends first-person camera control while a UI is up) - the same
+            // state TryOpenMenu() uses normally. _previousGameState stays Normal so
+            // CloseMenu() resolves to a working state on exit regardless of what was stuck.
+            _previousGameState = GameState.Normal;
+            if (KickStarter.stateHandler != null)
+            {
+                KickStarter.stateHandler.gameState = GameState.Paused;
+            }
+            _menuOpen = true;
+
+            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
+            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        // Logs every currently-active ActionList/ActionListAsset and, for each one, every
+        // action it contains with its type name - and *which specific action* has
+        // AC.Action.isRunning set, since that's the exact one still mid-execution when we
+        // hit this. Called right before KillAllLists() so this is a snapshot of what we're
+        // about to force-stop - the isRunning-marked action is the actual culprit, not just
+        // "some cutscene somewhere".
+        private void LogActiveActionLists()
+        {
+            LogActiveListsFrom("scene", KickStarter.actionListManager?.activeLists);
+            LogActiveListsFrom("asset", KickStarter.actionListAssetManager?.activeLists);
+        }
+
+        private void LogActiveListsFrom(string kind, List<AC.ActiveList> lists)
+        {
+            if (lists == null || lists.Count == 0)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] No active {kind} ActionLists.");
+                return;
+            }
+
+            foreach (AC.ActiveList activeList in lists)
+            {
+                string listName = activeList.actionList != null ? activeList.actionList.name
+                    : activeList.actionListAsset != null ? activeList.actionListAsset.name
+                    : "unknown";
+                List<AC.Action> actions = activeList.actionList != null ? activeList.actionList.actions
+                    : activeList.actionListAsset?.actions;
+
+                if (actions == null)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': (no actions available)");
+                    continue;
+                }
+
+                List<string> actionDescriptions = new List<string>();
+                foreach (AC.Action action in actions)
+                {
+                    string marker = action != null && action.isRunning ? "*RUNNING*" : "";
+                    actionDescriptions.Add((action?.GetType().Name ?? "null") + marker);
+                }
+                Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': [{string.Join(", ", actionDescriptions)}]");
+            }
         }
 
         private void CloseMenu()
@@ -219,6 +481,8 @@ namespace BlakeManorFastTravel
             {
                 return new List<EHSceneCollection>();
             }
+
+            LogKeyedHandleCandidatesOnce(manager);
 
             SpookyDoorway.SceneCollection current = manager.GetCurrentlyOpenCollection();
             int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
@@ -261,6 +525,19 @@ namespace BlakeManorFastTravel
                     continue;
                 }
 
+                // Having been in a room once doesn't mean it's currently accessible the
+                // normal way: a corridor/room key you don't have (yet, or ever, in a given
+                // save) still gates entry, and a handful of rooms (the Dining Room) are only
+                // open during specific times regardless of visited state. Fails open for
+                // anything we don't have data on, so this can only narrow what room.<handle>
+                // already allowed, never expand it. _ignoreAccessChecks (the menu toggle)
+                // skips this specific gate on purpose; it never touches the crash-safety
+                // checks above/below it.
+                if (!_ignoreAccessChecks && !HasPassableChecks(ehCollection.handle))
+                {
+                    continue;
+                }
+
                 if (!bestByHandle.TryGetValue(ehCollection.handle, out EHSceneCollection existing) ||
                     IsBetterVariantForToday(ehCollection, existing))
                 {
@@ -287,6 +564,124 @@ namespace BlakeManorFastTravel
         private static string DisplayName(EHSceneCollection collection)
         {
             return string.IsNullOrEmpty(collection.label) ? collection.Path : collection.label;
+        }
+
+        // DEV-ONLY: logs every unique handle in the game (with its label) via BepInEx's own
+        // Logger (cheap, one-shot - not Unity's Debug.Log, so none of the performance
+        // concerns elsewhere in this file apply). This exists only to get real handle
+        // strings for building an accurate DoorKeys->handle table instead of guessing off
+        // scene names seen in unrelated logs - remove once that table is filled in and
+        // verified against this output.
+        private void LogKeyedHandleCandidatesOnce(SpookyDoorway.SceneCollectionsManager manager)
+        {
+            if (_loggedKeyedHandleCandidates)
+            {
+                return;
+            }
+            _loggedKeyedHandleCandidates = true;
+
+            SortedDictionary<string, string> labelByHandle = new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (SpookyDoorway.SceneCollection collection in manager.Collections)
+            {
+                EHSceneCollection ehCollection = collection as EHSceneCollection;
+                if (ehCollection == null || string.IsNullOrEmpty(ehCollection.handle))
+                {
+                    continue;
+                }
+                labelByHandle[ehCollection.handle] = ehCollection.label ?? "";
+            }
+
+            Logger.LogInfo($"[BlakeManorFastTravel] Dumping all {labelByHandle.Count} unique handles:");
+            foreach (KeyValuePair<string, string> entry in labelByHandle)
+            {
+                Logger.LogInfo($"[BlakeManorFastTravel]   handle='{entry.Key}' label='{entry.Value}'");
+            }
+            Logger.LogInfo("[BlakeManorFastTravel] End of handle dump.");
+        }
+
+        // Every DoorScanIntervalSeconds, scans every AC.ActionList currently loaded
+        // (regardless of which scene it's in) for ones that also contain an ActionScene_EH
+        // - i.e. a door's Interaction. Any AC.ActionCheck-derived action found in the same
+        // list (an inventory check for a key door, an ActionEHCheckTime for a time-gated
+        // one, etc.) gets registered against that destination handle in
+        // _conditionChecksByHandle for HasPassableChecks() to call live later - see the
+        // comment on that field for why we don't need to know or hand-verify what kind of
+        // check it is. Also logs what it finds to _doorLinksLogPath, which is how we
+        // originally identified ActionEHCheckTime as the Dining Room's gate.
+        //
+        // Doors only exist as live objects in whatever scene they're placed in, so this
+        // only ever sees doors in scenes that have actually loaded - it builds up coverage
+        // as you walk/fast-travel around, not all at once. Already-scanned ActionLists are
+        // skipped on later passes so walking back through an area doesn't redo the work.
+        private void ScanForDoorLinksThrottled()
+        {
+            if (Time.unscaledTime - _lastDoorScanTime < DoorScanIntervalSeconds)
+            {
+                return;
+            }
+            _lastDoorScanTime = Time.unscaledTime;
+
+            AC.ActionList[] actionLists = UnityEngine.Object.FindObjectsByType<AC.ActionList>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+
+            foreach (AC.ActionList actionList in actionLists)
+            {
+                int id = actionList.GetInstanceID();
+                if (!_scannedActionListIds.Add(id))
+                {
+                    continue; // already scanned this one
+                }
+
+                ActionScene_EH sceneAction = null;
+                List<AC.ActionCheck> checks = new List<AC.ActionCheck>();
+                foreach (AC.Action action in actionList.actions)
+                {
+                    if (action is ActionScene_EH s)
+                    {
+                        sceneAction = s;
+                    }
+                    else if (action is AC.ActionCheck check)
+                    {
+                        checks.Add(check);
+                    }
+                }
+
+                if (sceneAction != null)
+                {
+                    RegisterDoorLink(actionList, sceneAction, checks);
+                }
+            }
+        }
+
+        private void RegisterDoorLink(AC.ActionList actionList, ActionScene_EH sceneAction, List<AC.ActionCheck> checks)
+        {
+            string handle = sceneAction.sceneHandle;
+            if (checks.Count > 0)
+            {
+                if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> existing))
+                {
+                    existing = new List<AC.ActionCheck>();
+                    _conditionChecksByHandle[handle] = existing;
+                }
+                existing.AddRange(checks);
+            }
+
+            EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
+            string fromHandle = current?.handle ?? "unknown";
+            string checkTypeNames = checks.Count == 0 ? "none" : string.Join(", ", checks.ConvertAll(c => c.GetType().Name));
+            string line =
+                $"[{DateTime.Now:HH:mm:ss}] destHandle='{handle}' fromRoom='{fromHandle}' " +
+                $"actionList='{actionList.name}' checks=[{checkTypeNames}]";
+
+            Logger.LogInfo("[BlakeManorFastTravel] " + line);
+            try
+            {
+                File.AppendAllText(_doorLinksLogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] Failed to write door_links.log: " + ex.Message);
+            }
         }
 
         private void OnGUI()
@@ -368,6 +763,16 @@ namespace BlakeManorFastTravel
 
             GUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
+            // Solid gold fill (LockToggleOn) means bypass is on; the dark wine fill every
+            // destination button uses means it's off, reading as blending into the panel
+            // rather than a fully transparent gap.
+            GUIStyle toggleStyle = _ignoreAccessChecks ? MenuTheme.LockToggleOn : MenuTheme.DestinationButton;
+            if (GUILayout.Button(_ignoreAccessChecks ? "Bypass Locks: Enabled" : "Bypass Locks: Disabled", toggleStyle, GUILayout.Width(190f * scale), GUILayout.Height(30f * scale)))
+            {
+                _ignoreAccessChecks = !_ignoreAccessChecks;
+                _destinations = GetDiscoveredDestinations();
+            }
+            GUILayout.Space(14f * scale);
             if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(120f * scale), GUILayout.Height(30f * scale)))
             {
                 CloseMenu();
@@ -455,8 +860,30 @@ namespace BlakeManorFastTravel
 
         private void TravelTo(EHSceneCollection destination)
         {
+            Logger.LogInfo(
+                $"[BlakeManorFastTravel] TravelTo requested: dest='{destination.Path}' handle='{destination.handle}' " +
+                $"IsLoading={KickStarter.sceneChanger?.IsLoading()} " +
+                $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}'");
             try
             {
+                // EHSceneChanger.ChangeScene() opens with:
+                //   if (isLoading || ...) { return; }
+                // - if a scene change is already in progress, calling it again is a silent
+                // no-op: the actual load is dropped, but everything ChangeScene does *before*
+                // that check (hiding menus, exiting analysis mode, etc.) still runs. That's a
+                // real failure mode we hit: fast travel triggered while a previous one hadn't
+                // finished loading leaves the screen stuck on the old (already-partway-torn-
+                // down) scene while whatever ambient audio/cues fired regardless keep playing -
+                // audio, but no picture. Checking IsLoading() here (the same public accessor
+                // TryOpenMenu() uses to keep the menu from reopening mid-load) turns that into
+                // a clean, visible refusal instead of a silent half-transition.
+                if (KickStarter.sceneChanger != null && KickStarter.sceneChanger.IsLoading())
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Refused travel to '{destination.Path}' - a scene change was already in progress.");
+                    _statusMessage = "Still loading the last destination - try again in a moment.";
+                    return;
+                }
+
                 // Belt-and-suspenders re-check: GetDiscoveredDestinations() should only
                 // ever hand us an in-bounds destination, but re-verify right before the
                 // scene load actually happens (the source of truth this mirrors is
@@ -468,6 +895,16 @@ namespace BlakeManorFastTravel
                     currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count)
                 {
                     _statusMessage = "Can't fast travel there right now - try again after moving normally.";
+                    return;
+                }
+
+                // Same re-check pattern as above: GetDiscoveredDestinations() already
+                // filters on this, but a key/time condition can flip between menu-build and
+                // click (spend the key, or the clock ticks past meal time), so verify again
+                // right before actually loading. Also skipped by _ignoreAccessChecks.
+                if (!_ignoreAccessChecks && !HasPassableChecks(destination.handle))
+                {
+                    _statusMessage = "Can't fast travel there right now - it's currently locked.";
                     return;
                 }
 
@@ -499,6 +936,10 @@ namespace BlakeManorFastTravel
                     useLoadingMusic: KickStarter.settingsManager.useLoadingMusic,
                     loadingMusicID: KickStarter.settingsManager.loadingMusicID,
                     loopLoading: true);
+
+                Logger.LogInfo(
+                    $"[BlakeManorFastTravel] ChangeScene called for '{destination.Path}', now " +
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}");
 
                 _traveling = true;
                 _travelDestinationPath = destination.Path;
@@ -562,6 +1003,76 @@ namespace BlakeManorFastTravel
         private static void Postfix()
         {
             Debug.unityLogger.logEnabled = _wasLogEnabled;
+        }
+    }
+
+    // The actual root cause of the black-screen-with-audio and player-frozen hangs we've
+    // hit fast-traveling into some rooms: EHSceneSettings.GetPlayerStart() falls back to
+    //     Debug.Log("Can't find any starter, return null");
+    //     return null;
+    // whenever none of a room's PlayerStart markers match wherever the player is arriving
+    // from - one of its match conditions is the exact SceneCollectionInfo.playerStart name,
+    // which our own TravelTo() always passes as null, and another is "previous scene", which
+    // fast travel can make anything (a real door only ever connects scenes actually wired
+    // together at design time, so this path is never exercised that way). The caller,
+    // AC.SceneSettings.OnStart(), then does playerStart.transform.position immediately after
+    // with NO null check:
+    //     LoadedPlayerStart = true;
+    //     LastLoadedPlayerStart = KickStarter.sceneChanger.GetStartPosition(playerStart.transform.position);
+    // - an unhandled NullReferenceException that silently aborts the rest of OnStart(),
+    // including (we believe) whatever re-enables player movement/animation, while whatever
+    // ran earlier in the method (ambience audio, etc.) already fired. Scene state itself
+    // still ends up fully loaded/current, which is why our own "did the travel complete"
+    // check (GetCurrentlyOpenCollection() matching the destination) sees success even when
+    // the player is left stuck.
+    //
+    // Fix: fall back to a PlayerStart present in the newly-loaded scene rather than
+    // returning null - the player may spawn at a not-quite-right spot instead of exactly
+    // where a door would have placed them, but that beats a broken load every time.
+    //
+    // Scoped to __instance's own scene, not just "any PlayerStart currently loaded
+    // anywhere": this game keeps several scene layers loaded concurrently (and briefly
+    // overlapping during a transition), so an unscoped search can hand back a PlayerStart
+    // belonging to a *different* scene entirely - not null, so no crash, but physically
+    // nonsensical (e.g. inside unloaded/foreign geometry). That still passes our own "did
+    // the travel complete" check (the destination scene collection genuinely is current)
+    // while leaving the player stuck unable to move - same visible symptom as the null
+    // crash this patch was written for, just with the crash itself avoided.
+    [HarmonyPatch(typeof(EHSceneSettings), "GetPlayerStart")]
+    internal static class EHSceneSettings_GetPlayerStart_FallbackWhenUnresolved
+    {
+        private static readonly BepInEx.Logging.ManualLogSource Log =
+            BepInEx.Logging.Logger.CreateLogSource(FastTravelPlugin.PluginName);
+
+        private static void Postfix(EHSceneSettings __instance, ref PlayerStart __result)
+        {
+            if (__result != null)
+            {
+                return;
+            }
+
+            UnityEngine.SceneManagement.Scene ownScene = __instance.gameObject.scene;
+            PlayerStart[] allPlayerStarts = UnityEngine.Object.FindObjectsByType<PlayerStart>(
+                FindObjectsInactive.Include, FindObjectsSortMode.None);
+
+            foreach (PlayerStart candidate in allPlayerStarts)
+            {
+                if (candidate.gameObject.scene == ownScene)
+                {
+                    __result = candidate;
+                    return;
+                }
+            }
+
+            // No scene-scoped match either - true last resort, logged since this spawn
+            // location is unverified and could still be wrong.
+            if (allPlayerStarts.Length > 0)
+            {
+                Log.LogWarning(
+                    $"[BlakeManorFastTravel] GetPlayerStart(): no PlayerStart found in scene '{ownScene.name}' - " +
+                    "falling back to one from a different scene, spawn position may be wrong.");
+                __result = allPlayerStarts[0];
+            }
         }
     }
 }
