@@ -372,6 +372,7 @@ namespace BlakeManorFastTravel
             // every currently-active ActionList, which is the actual fix: it force-stops
             // whatever's still running, not just the state flag that was supposed to
             // reflect it.
+            LogActiveActionLists();
             try
             {
                 AC.ActionListManager.KillAll();
@@ -394,6 +395,50 @@ namespace BlakeManorFastTravel
 
             _windowRect.x = (Screen.width - _windowRect.width) / 2f;
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        // Logs every currently-active ActionList/ActionListAsset and, for each one, every
+        // action it contains with its type name - and *which specific action* has
+        // AC.Action.isRunning set, since that's the exact one still mid-execution when we
+        // hit this. Called right before KillAllLists() so this is a snapshot of what we're
+        // about to force-stop - the isRunning-marked action is the actual culprit, not just
+        // "some cutscene somewhere".
+        private void LogActiveActionLists()
+        {
+            LogActiveListsFrom("scene", KickStarter.actionListManager?.activeLists);
+            LogActiveListsFrom("asset", KickStarter.actionListAssetManager?.activeLists);
+        }
+
+        private void LogActiveListsFrom(string kind, List<AC.ActiveList> lists)
+        {
+            if (lists == null || lists.Count == 0)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] No active {kind} ActionLists.");
+                return;
+            }
+
+            foreach (AC.ActiveList activeList in lists)
+            {
+                string listName = activeList.actionList != null ? activeList.actionList.name
+                    : activeList.actionListAsset != null ? activeList.actionListAsset.name
+                    : "unknown";
+                List<AC.Action> actions = activeList.actionList != null ? activeList.actionList.actions
+                    : activeList.actionListAsset?.actions;
+
+                if (actions == null)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': (no actions available)");
+                    continue;
+                }
+
+                List<string> actionDescriptions = new List<string>();
+                foreach (AC.Action action in actions)
+                {
+                    string marker = action != null && action.isRunning ? "*RUNNING*" : "";
+                    actionDescriptions.Add((action?.GetType().Name ?? "null") + marker);
+                }
+                Logger.LogWarning($"[BlakeManorFastTravel] Active {kind} list '{listName}': [{string.Join(", ", actionDescriptions)}]");
+            }
         }
 
         private void CloseMenu()
