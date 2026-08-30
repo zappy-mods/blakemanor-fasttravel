@@ -6,10 +6,24 @@
     <AssemblyName>BlakeManorFastTravel</AssemblyName>
     <Nullable>disable</Nullable>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <GameDir>$BLAKEMANOR_GAME_DIR</GameDir>
+    <!--
+      Path to your own "The Seance of Blake Manor" install, used only to find reference
+      DLLs to build against (nothing here gets copied/shipped). Never hardcode this - it's
+      personal to each machine. Set it one of two ways:
+        1. An environment variable named BLAKEMANOR_GAME_DIR, or
+        2. dotnet build -p:GameDir="C:\path\to\The Seance of Blake Manor"
+      See README.md for details.
+    -->
+    <GameDir Condition="'$(GameDir)' == ''">$(BLAKEMANOR_GAME_DIR)</GameDir>
     <ManagedDir>$(GameDir)/The Seance of Blake Manor_Data/Managed</ManagedDir>
     <BepInExCoreDir>$(GameDir)/BepInEx/core</BepInExCoreDir>
   </PropertyGroup>
+
+  <Target Name="EnsureGameDirSet" BeforeTargets="ResolveAssemblyReferences;CoreCompile">
+    <Error
+      Condition="'$(GameDir)' == ''"
+      Text="GameDir is not set. Set the BLAKEMANOR_GAME_DIR environment variable to your game install folder, or pass -p:GameDir=&quot;C:\path\to\The Seance of Blake Manor&quot; when building. See README.md." />
+  </Target>
 
   <ItemGroup>
     <!-- BepInEx / Harmony -->

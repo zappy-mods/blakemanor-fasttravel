@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using AC;
 using BepInEx;
+using BepInEx.Configuration;
 using HarmonyLib;
 using SpookyDoorway.EldritchHouse.Runtime.AC;
 using SpookyDoorway.EldritchHouse.Runtime.AC.UI.Journal.Map;
@@ -78,7 +79,7 @@ namespace BlakeManorFastTravel
     {
         public const string PluginGuid = "zappymods.blakemanor.fasttravel";
         public const string PluginName = "Blake Manor Fast Travel";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "0.0.1";
 
         private const float DefaultWidth = 440f;
         private const float DefaultHeight = 520f;
@@ -96,6 +97,10 @@ namespace BlakeManorFastTravel
         private List<EHSceneCollection> _destinations = new List<EHSceneCollection>();
         private string _statusMessage = "";
         private Harmony _harmony;
+
+        // User-facing config (BepInEx/config/zappymods.blakemanor.fasttravel.cfg).
+        private ConfigEntry<Key> _hotkeyConfig;
+        private ConfigEntry<bool> _diagnosticsConfig;
 
         // Menu toggle to bypass HasPassableChecks() (keys/time-of-day/etc.) - resets to off
         // every launch, on purpose, so a forgotten toggle from last session can't surprise
@@ -118,23 +123,24 @@ namespace BlakeManorFastTravel
         private float _travelStartTime;
         private float _lastTravelPollTime;
 
-        // DEV-ONLY diagnostic (see LogKeyedHandleCandidatesOnce): true once we've logged
-        // real handle strings, so we can build an accurate DoorKeys->handle table instead
-        // of guessing. Remove once that table is filled in and verified.
+        // Diagnostic-only, gated behind _diagnosticsConfig (see LogKeyedHandleCandidatesOnce):
+        // true once we've logged every registered handle - useful for troubleshooting, not
+        // needed for the plugin to function.
         private bool _loggedKeyedHandleCandidates;
 
-        // DEV-ONLY diagnostic (see ScanForDoorLinksThrottled) turned real mechanism: scans
-        // every AC.ActionList currently loaded for ones that also change scenes
-        // (ActionScene_EH), and caches every AC.ActionCheck-derived action found alongside
-        // it - an inventory check for a key door, an ActionEHCheckTime for something like
-        // the Dining Room's "closed outside of meal times" gate, or any other condition -
-        // keyed by destination handle. No hand-built key/handle table needed: whatever gets
-        // captured is authoritative by construction, since HasPassableChecks() calls the
-        // game's own CheckCondition() live rather than reimplementing what it means.
-        // Doors only exist as live objects in whatever scene they're placed in, so this
-        // only ever covers doors in scenes that have actually loaded - it fills in as you
-        // walk/fast-travel around, not all at once; anything not yet scanned just falls
-        // back to the plain room.<handle> >= 2 check, same as before this existed.
+        // Core mechanism (see ScanForDoorLinksThrottled), always runs regardless of the
+        // diagnostics toggle: scans every AC.ActionList currently loaded for ones that also
+        // change scenes (ActionScene_EH), and caches every AC.ActionCheck-derived action
+        // found alongside it - an inventory check for a key door, an ActionEHCheckTime for
+        // something like the Dining Room's "closed outside of meal times" gate, or any other
+        // condition - keyed by destination handle. No hand-built key/handle table needed:
+        // whatever gets captured is authoritative by construction, since HasPassableChecks()
+        // calls the game's own CheckCondition() live rather than reimplementing what it
+        // means. Doors only exist as live objects in whatever scene they're placed in, so
+        // this only ever covers doors in scenes that have actually loaded - it fills in as
+        // you walk/fast-travel around, not all at once; anything not yet scanned just falls
+        // back to the plain room.<handle> >= 2 check, same as before this existed. Only its
+        // logging (RegisterDoorLink) is gated behind _diagnosticsConfig.
         private const float DoorScanIntervalSeconds = 2f;
         private float _lastDoorScanTime;
         private readonly HashSet<int> _scannedActionListIds = new HashSet<int>();
@@ -166,15 +172,27 @@ namespace BlakeManorFastTravel
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
 
-            string pluginDir = Path.GetDirectoryName(typeof(FastTravelPlugin).Assembly.Location) ?? ".";
-            _doorLinksLogPath = Path.Combine(pluginDir, "door_links.log");
-            try
+            _hotkeyConfig = Config.Bind(
+                "General", "Hotkey", Key.F9,
+                "The key that opens/closes the fast travel menu.");
+            _diagnosticsConfig = Config.Bind(
+                "Diagnostics", "EnableDiagnosticLogging", false,
+                "Logs extra troubleshooting info (door discovery scans, a periodic game-state " +
+                "heartbeat, and a door_links.log file next to this plugin) to help diagnose bug " +
+                "reports. Off by default - only turn this on if asked to when reporting an issue.");
+
+            if (_diagnosticsConfig.Value)
             {
-                File.AppendAllText(_doorLinksLogPath, $"--- session started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---{Environment.NewLine}");
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] Failed to open door_links.log: " + ex.Message);
+                string pluginDir = Path.GetDirectoryName(typeof(FastTravelPlugin).Assembly.Location) ?? ".";
+                _doorLinksLogPath = Path.Combine(pluginDir, "door_links.log");
+                try
+                {
+                    File.AppendAllText(_doorLinksLogPath, $"--- session started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---{Environment.NewLine}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning("[BlakeManorFastTravel] Failed to open door_links.log: " + ex.Message);
+                }
             }
         }
 
@@ -190,8 +208,14 @@ namespace BlakeManorFastTravel
                 UpdateTravelingState();
             }
 
+            // Always runs, regardless of the diagnostics toggle: this is what populates
+            // _conditionChecksByHandle, which the key/time-gating feature depends on - only
+            // its *logging* is diagnostics-gated (see RegisterDoorLink).
             ScanForDoorLinksThrottled();
-            LogHeartbeatStateThrottled();
+            if (_diagnosticsConfig.Value)
+            {
+                LogHeartbeatStateThrottled();
+            }
 
             Keyboard keyboard = Keyboard.current;
             if (keyboard == null)
@@ -199,7 +223,7 @@ namespace BlakeManorFastTravel
                 return;
             }
 
-            if (keyboard.f9Key.wasPressedThisFrame)
+            if (keyboard[_hotkeyConfig.Value].wasPressedThisFrame)
             {
                 if (_menuOpen)
                 {
@@ -360,7 +384,10 @@ namespace BlakeManorFastTravel
                 return new List<EHSceneCollection>();
             }
 
-            LogKeyedHandleCandidatesOnce(manager);
+            if (_diagnosticsConfig.Value)
+            {
+                LogKeyedHandleCandidatesOnce(manager);
+            }
 
             SpookyDoorway.SceneCollection current = manager.GetCurrentlyOpenCollection();
             int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
@@ -444,12 +471,10 @@ namespace BlakeManorFastTravel
             return string.IsNullOrEmpty(collection.label) ? collection.Path : collection.label;
         }
 
-        // DEV-ONLY: logs every unique handle in the game (with its label) via BepInEx's own
-        // Logger (cheap, one-shot - not Unity's Debug.Log, so none of the performance
-        // concerns elsewhere in this file apply). This exists only to get real handle
-        // strings for building an accurate DoorKeys->handle table instead of guessing off
-        // scene names seen in unrelated logs - remove once that table is filled in and
-        // verified against this output.
+        // Diagnostics-only (see _diagnosticsConfig): logs every unique handle in the game
+        // (with its label) via BepInEx's own Logger (cheap, one-shot - not Unity's
+        // Debug.Log, so none of the performance concerns elsewhere in this file apply).
+        // Purely informational for troubleshooting bug reports.
         private void LogKeyedHandleCandidatesOnce(SpookyDoorway.SceneCollectionsManager manager)
         {
             if (_loggedKeyedHandleCandidates)
@@ -544,6 +569,11 @@ namespace BlakeManorFastTravel
                 existing.AddRange(checks);
             }
 
+            if (!_diagnosticsConfig.Value)
+            {
+                return;
+            }
+
             EHSceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection() as EHSceneCollection;
             string fromHandle = current?.handle ?? "unknown";
             string checkTypeNames = checks.Count == 0 ? "none" : string.Join(", ", checks.ConvertAll(c => c.GetType().Name));
@@ -600,7 +630,7 @@ namespace BlakeManorFastTravel
 
             GUILayout.Space(10);
             GUILayout.Label("Choose a location you've already visited", MenuTheme.Subtitle);
-            GUILayout.Label("F9 or Esc to close", MenuTheme.Subtitle);
+            GUILayout.Label($"{_hotkeyConfig.Value} or Esc to close", MenuTheme.Subtitle);
             GUILayout.Space(12);
 
             GUILayout.BeginHorizontal();
