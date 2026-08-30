@@ -348,16 +348,12 @@ namespace BlakeManorFastTravel
                 // would freeze it on frame one forever if it loses that race - explaining both
                 // the specific stuck actions we've seen and why this is intermittent (a race,
                 // not a deterministic bug) rather than affecting every room every time.
-                // Forcing it back to 1 here, once we've independently confirmed the load
-                // itself is done, is a safety net against that race - harmless when
-                // unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause
-                // anyway), and should un-stick this automatically without ever needing
-                // Shift+F9 if this theory is right.
-                if (Time.timeScale != 1f)
-                {
-                    Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after travel completed - forcing back to 1.");
-                    Time.timeScale = 1f;
-                }
+                // RecoverFromPossibleHang() covers that race (forcing timeScale back to 1)
+                // and, defensively, the same hung-ActionList/hung-conversation cases the
+                // emergency and normal-close paths handle - this is the original scenario
+                // that motivated building it, so it gets the full treatment, not just the
+                // timeScale piece. Harmless when unnecessary, same reasoning as those paths.
+                RecoverFromPossibleHang();
                 _traveling = false;
             }
         }
@@ -407,51 +403,7 @@ namespace BlakeManorFastTravel
             _destinations = GetDiscoveredDestinations();
             _statusMessage = "Emergency mode - locks/loading checks bypassed to open this menu.";
 
-            // The actual mechanism behind the stuck-gameState hangs: heartbeat logging
-            // caught gameState stuck on Cutscene (not just "not Normal") for 20+ seconds
-            // straight - i.e. an EHSceneSettings on-enter cutscene that started but never
-            // finished, most likely because it's waiting on the player's position/a marker
-            // it expects that our fast-travel spawn point doesn't satisfy. Testing showed
-            // that just reassigning gameState (Normal, Paused, or a Normal->Paused pass-
-            // through) isn't enough on its own - the camera kept rotating toward a fixed
-            // direction regardless of mouse input, meaning the stuck cutscene's own
-            // face/look action was still actively running and re-applying itself every
-            // frame, independent of gameState. KillAllLists() (AC.ActionListManager) resets
-            // every currently-active ActionList, which is the actual fix: it force-stops
-            // whatever's still running, not just the state flag that was supposed to
-            // reflect it.
-            LogActiveActionLists();
-            try
-            {
-                AC.ActionListManager.KillAll();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
-            }
-
-            // A hung dialogue (e.g. interacting with a book/NPC) is a separate subsystem
-            // from AC's ActionLists - PixelCrushers Dialogue System, via the game's own
-            // com.spookydoorway.dialogue-system.dll - so KillAllLists() above doesn't touch
-            // it. Confirmed via heartbeat logging: gameState got stuck on Cutscene with
-            // Time.timeScale reading a healthy 1 the entire time (ruling out the timeScale
-            // race that fix addresses), right after interacting with a Library book - the
-            // game's own EHSceneChanger.ChangeScene() already calls
-            // DialogueManager.StopConversation() defensively before changing scenes for
-            // exactly this reason, so mirroring that call here is following the game's own
-            // established pattern, not a guess.
-            try
-            {
-                if (PixelCrushers.DialogueSystem.DialogueManager.isConversationActive)
-                {
-                    Logger.LogWarning("[BlakeManorFastTravel] Stopping an active conversation as part of emergency recovery.");
-                    PixelCrushers.DialogueSystem.DialogueManager.StopConversation();
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] StopConversation() failed: " + ex.Message);
-            }
+            RecoverFromPossibleHang();
 
             // Paused is what actually triggers AC's own menu-mode behavior (frees the mouse
             // cursor, suspends first-person camera control while a UI is up) - the same
@@ -466,6 +418,62 @@ namespace BlakeManorFastTravel
 
             _windowRect.x = (Screen.width - _windowRect.width) / 2f;
             _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        // Shared by both the emergency (Shift+F9) and normal (F9/Esc/Close) menu-close
+        // paths - every stuck-camera/stuck-player report we've chased down turned out to
+        // need one of these three, and none of them are safe to assume only the emergency
+        // path can hit: gameState stuck off Normal is what originally motivated Shift+F9
+        // existing at all, but the *normal* open/close path can trip the exact same
+        // Time.timeScale race (confirmed: camera detaching/spinning after a plain F9
+        // open+close, no travel involved), and a hung PixelCrushers conversation (confirmed
+        // via a Library book interaction) is just as reachable through normal play as
+        // through a stuck emergency scenario.
+        //
+        // - KillAllLists() (AC.ActionListManager) force-stops any still-running AC
+        //   ActionList/Cutscene - covers a stuck on-enter cutscene whose face/look action
+        //   would otherwise keep re-applying itself every frame regardless of gameState.
+        // - DialogueManager.StopConversation() covers PixelCrushers Dialogue System
+        //   conversations, a separate subsystem KillAllLists() doesn't touch - the game's
+        //   own EHSceneChanger.ChangeScene() already calls this defensively before every
+        //   scene change, so this mirrors an established pattern, not a guess.
+        // - Forcing Time.timeScale back to 1 covers the race described on
+        //   UpdateTravelingState()'s completion branch.
+        //
+        // All three are harmless when unnecessary - gameplay always wants a running
+        // ActionList to finish, no conversation active, and timeScale=1 outside a genuine
+        // cutscene/pause anyway - so running them defensively on every menu close costs
+        // nothing when nothing was actually stuck.
+        private void RecoverFromPossibleHang()
+        {
+            LogActiveActionLists();
+            try
+            {
+                AC.ActionListManager.KillAll();
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
+            }
+
+            try
+            {
+                if (PixelCrushers.DialogueSystem.DialogueManager.isConversationActive)
+                {
+                    Logger.LogWarning("[BlakeManorFastTravel] Stopping an active conversation as part of hang recovery.");
+                    PixelCrushers.DialogueSystem.DialogueManager.StopConversation();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] StopConversation() failed: " + ex.Message);
+            }
+
+            if (Time.timeScale != 1f)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} - forcing back to 1.");
+                Time.timeScale = 1f;
+            }
         }
 
         // Logs every currently-active ActionList/ActionListAsset and, for each one, every
@@ -520,17 +528,12 @@ namespace BlakeManorFastTravel
                 KickStarter.stateHandler.gameState = _previousGameState;
             }
 
-            // Same safety net as UpdateTravelingState()'s travel-completion check, applied
-            // here too: reported symptom was the camera detaching/spinning after opening
-            // and closing the menu with no travel involved at all, which the travel-only
-            // fix never touches. If our own Paused<->Normal toggling can trip the same
-            // timeScale race independent of scene loading, this closes that gap; harmless
-            // when unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause).
-            if (Time.timeScale != 1f)
-            {
-                Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after closing the menu - forcing back to 1.");
-                Time.timeScale = 1f;
-            }
+            // Reported symptom: the camera detaching/spinning after a plain F9 open+close,
+            // with no travel involved at all - so this needs the same recovery the
+            // emergency path gets, not just the travel-completion path. See the comment on
+            // RecoverFromPossibleHang() for why all three of what it does are safe to run
+            // unconditionally here.
+            RecoverFromPossibleHang();
         }
 
         private List<EHSceneCollection> GetDiscoveredDestinations()
