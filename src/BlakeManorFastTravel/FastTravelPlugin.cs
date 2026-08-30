@@ -430,6 +430,29 @@ namespace BlakeManorFastTravel
                 Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
             }
 
+            // A hung dialogue (e.g. interacting with a book/NPC) is a separate subsystem
+            // from AC's ActionLists - PixelCrushers Dialogue System, via the game's own
+            // com.spookydoorway.dialogue-system.dll - so KillAllLists() above doesn't touch
+            // it. Confirmed via heartbeat logging: gameState got stuck on Cutscene with
+            // Time.timeScale reading a healthy 1 the entire time (ruling out the timeScale
+            // race that fix addresses), right after interacting with a Library book - the
+            // game's own EHSceneChanger.ChangeScene() already calls
+            // DialogueManager.StopConversation() defensively before changing scenes for
+            // exactly this reason, so mirroring that call here is following the game's own
+            // established pattern, not a guess.
+            try
+            {
+                if (PixelCrushers.DialogueSystem.DialogueManager.isConversationActive)
+                {
+                    Logger.LogWarning("[BlakeManorFastTravel] Stopping an active conversation as part of emergency recovery.");
+                    PixelCrushers.DialogueSystem.DialogueManager.StopConversation();
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[BlakeManorFastTravel] StopConversation() failed: " + ex.Message);
+            }
+
             // Paused is what actually triggers AC's own menu-mode behavior (frees the mouse
             // cursor, suspends first-person camera control while a UI is up) - the same
             // state TryOpenMenu() uses normally. _previousGameState stays Normal so
@@ -495,6 +518,18 @@ namespace BlakeManorFastTravel
             if (KickStarter.stateHandler != null)
             {
                 KickStarter.stateHandler.gameState = _previousGameState;
+            }
+
+            // Same safety net as UpdateTravelingState()'s travel-completion check, applied
+            // here too: reported symptom was the camera detaching/spinning after opening
+            // and closing the menu with no travel involved at all, which the travel-only
+            // fix never touches. If our own Paused<->Normal toggling can trip the same
+            // timeScale race independent of scene loading, this closes that gap; harmless
+            // when unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause).
+            if (Time.timeScale != 1f)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after closing the menu - forcing back to 1.");
+                Time.timeScale = 1f;
             }
         }
 

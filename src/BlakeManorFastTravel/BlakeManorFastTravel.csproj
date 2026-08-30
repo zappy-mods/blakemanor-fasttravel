@@ -83,6 +83,10 @@
       <HintPath>$(ManagedDir)/com.spookydoorway.scene-slinger.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="com.spookydoorway.dialogue-system">
+      <HintPath>$(ManagedDir)/com.spookydoorway.dialogue-system.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>
