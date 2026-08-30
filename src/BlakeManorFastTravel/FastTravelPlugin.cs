@@ -259,7 +259,7 @@ namespace BlakeManorFastTravel
                 $"[BlakeManorFastTravel] heartbeat: gameState={KickStarter.stateHandler?.gameState} " +
                 $"IsLoading={KickStarter.sceneChanger?.IsLoading()} " +
                 $"activeScene='{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}' " +
-                $"playerNull={KickStarter.player == null}");
+                $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
         }
 
         // Clears _traveling once the world actually reflects the destination we asked for
@@ -309,7 +309,31 @@ namespace BlakeManorFastTravel
                 Logger.LogInfo(
                     $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after " +
                     $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
-                    $"playerNull={KickStarter.player == null}");
+                    $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
+
+                // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
+                // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
+                // shows the stuck action is an early step in a room's on-enter "OnStart"
+                // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
+                // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
+                // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
+                // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
+                // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
+                // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a
+                // race between "cutscene starts" and "timescale resets to 1 after loading"
+                // would freeze it on frame one forever if it loses that race - explaining both
+                // the specific stuck actions we've seen and why this is intermittent (a race,
+                // not a deterministic bug) rather than affecting every room every time.
+                // Forcing it back to 1 here, once we've independently confirmed the load
+                // itself is done, is a safety net against that race - harmless when
+                // unnecessary (gameplay always wants timeScale=1 outside cutscenes/pause
+                // anyway), and should un-stick this automatically without ever needing
+                // Shift+F9 if this theory is right.
+                if (Time.timeScale != 1f)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} after travel completed - forcing back to 1.");
+                    Time.timeScale = 1f;
+                }
                 _traveling = false;
             }
         }
