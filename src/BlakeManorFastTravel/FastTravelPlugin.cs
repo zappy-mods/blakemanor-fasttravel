@@ -167,7 +167,17 @@ namespace BlakeManorFastTravel
             }
             foreach (AC.ActionCheck check in checks)
             {
-                if (check != null && !check.CheckCondition())
+                if (check == null)
+                {
+                    continue;
+                }
+                bool passed = check.CheckCondition();
+                if (_diagnosticsConfig.Value)
+                {
+                    Logger.LogInfo(
+                        $"[BlakeManorFastTravel] HasPassableChecks('{handle}'): {check.GetType().Name} -> {(passed ? "pass" : "FAIL")}");
+                }
+                if (!passed)
                 {
                     return false;
                 }
@@ -745,6 +755,12 @@ namespace BlakeManorFastTravel
                 GVar discoveredVar = GlobalVariables.GetVariable("room." + ehCollection.handle);
                 if (discoveredVar == null || discoveredVar.val < 2)
                 {
+                    if (_diagnosticsConfig.Value)
+                    {
+                        Logger.LogInfo(
+                            $"[BlakeManorFastTravel] Excluding '{ehCollection.handle}': room.{ehCollection.handle} = " +
+                            $"{(discoveredVar == null ? "(no such variable)" : discoveredVar.val.ToString())} (needs >= 2).");
+                    }
                     continue; // not yet actually visited by the player
                 }
 
@@ -871,9 +887,22 @@ namespace BlakeManorFastTravel
                     {
                         sceneAction = s;
                     }
-                    else if (action is AC.ActionCheck check)
+                    // Deliberately excludes AC.ActionVarCheck: confirmed via diagnostics that
+                    // sitting an ActionVarCheck in the same list as a door's ActionScene_EH
+                    // doesn't reliably mean it's gating that door - ActionCheck's own
+                    // resultActionTrue/resultActionFail branches mean a check can fail without
+                    // stopping the list (or exist for an unrelated purpose entirely, e.g.
+                    // internal bookkeeping) with the door still reachable in normal play. Real
+                    // proof: every First Floor corridor (NorthEast/NorthWest/SouthEast/
+                    // SouthWest) - central hub rooms with no business being story-gated - was
+                    // being hidden from fast travel by a failing ActionVarCheck despite having
+                    // been visited already. ActionEHCheckTime (the Dining Room's actual
+                    // meal-times gate, the case this whole feature was built for) and
+                    // ActionInventoryCheck (key-item gates) don't have this problem in
+                    // practice and stay included.
+                    else if (action is ActionEHCheckTime || action is AC.ActionInventoryCheck)
                     {
-                        checks.Add(check);
+                        checks.Add((AC.ActionCheck)action);
                     }
                 }
 
