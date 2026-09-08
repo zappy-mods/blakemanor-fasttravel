@@ -25,8 +25,16 @@ namespace BlakeManorEvidenceTracker
         public const string PluginName = "Blake Manor Evidence Tracker";
         public const string PluginVersion = "0.0.1";
 
-        private const float WindowWidth = 560f;
-        private const float WindowHeight = 520f;
+        // Same resize scheme as Blake Manor Fast Travel (see MenuTheme.cs's copy-over note -
+        // a shared library covering this is worth doing once both mods stop actively
+        // changing, not mid-iteration).
+        private const float DefaultWidth = 560f;
+        private const float DefaultHeight = 520f;
+        private const float MinWidth = 420f;
+        private const float MinHeight = 340f;
+        private const float MaxWidth = 1000f;
+        private const float MaxHeight = 860f;
+        private const float ResizeHandleSize = 18f;
 
         private class ProposedFix
         {
@@ -52,7 +60,8 @@ namespace BlakeManorEvidenceTracker
         private bool _menuOpen;
         private GameState _previousGameState = GameState.Normal;
         private Vector2 _scrollPos;
-        private Rect _windowRect = new Rect(0f, 0f, WindowWidth, WindowHeight);
+        private Rect _windowRect = new Rect(0f, 0f, DefaultWidth, DefaultHeight);
+        private bool _resizingWindow;
         private readonly List<ProposedFix> _proposedFixes = new List<ProposedFix>();
         private string _statusMessage = "";
 
@@ -146,9 +155,15 @@ namespace BlakeManorEvidenceTracker
                 return;
             }
             MenuTheme.EnsureBuilt();
-            MenuTheme.ApplyScale(1f);
+
+            // Text (and button sizing) scales with the window, using width as the driver -
+            // clamped to the same ratio range MinWidth/MaxWidth already imply.
+            float scale = Mathf.Clamp(_windowRect.width / DefaultWidth, MinWidth / DefaultWidth, MaxWidth / DefaultWidth);
+            MenuTheme.ApplyScale(scale);
 
             GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), MenuTheme.Overlay);
+
+            HandleResize();
 
             GUI.Box(_windowRect, GUIContent.none, MenuTheme.Panel);
             GUILayout.BeginArea(_windowRect);
@@ -239,6 +254,59 @@ namespace BlakeManorEvidenceTracker
             GUILayout.Space(16);
 
             GUILayout.EndArea();
+            DrawResizeGrip();
+        }
+
+        // Drag-to-resize from the bottom-right corner, growing/shrinking symmetrically about
+        // the window's center - ported from Blake Manor Fast Travel's identical HandleResize()/
+        // DrawResizeGrip() (see the comment near DefaultWidth on why this is duplicated rather
+        // than shared for now).
+        private void HandleResize()
+        {
+            Event e = Event.current;
+            Rect handleRect = new Rect(
+                _windowRect.xMax - ResizeHandleSize,
+                _windowRect.yMax - ResizeHandleSize,
+                ResizeHandleSize,
+                ResizeHandleSize);
+
+            if (e.type == EventType.MouseDown && e.button == 0 && handleRect.Contains(e.mousePosition))
+            {
+                _resizingWindow = true;
+                e.Use();
+            }
+            else if (_resizingWindow && e.type == EventType.MouseDrag)
+            {
+                float newWidth = Mathf.Clamp(_windowRect.width + e.delta.x * 2f, MinWidth, MaxWidth);
+                float newHeight = Mathf.Clamp(_windowRect.height + e.delta.y * 2f, MinHeight, MaxHeight);
+                _windowRect.x -= (newWidth - _windowRect.width) / 2f;
+                _windowRect.y -= (newHeight - _windowRect.height) / 2f;
+                _windowRect.width = newWidth;
+                _windowRect.height = newHeight;
+                e.Use();
+            }
+            else if (_resizingWindow && (e.type == EventType.MouseUp || e.rawType == EventType.MouseUp))
+            {
+                _resizingWindow = false;
+                e.Use();
+            }
+        }
+
+        private void DrawResizeGrip()
+        {
+            const float dot = 3f;
+            const float gap = 5f;
+            float baseX = _windowRect.xMax - 6f;
+            float baseY = _windowRect.yMax - 6f;
+            for (int row = 0; row < 3; row++)
+            {
+                for (int col = 0; col <= row; col++)
+                {
+                    float x = baseX - row * gap + col * gap;
+                    float y = baseY - row * gap;
+                    GUI.DrawTexture(new Rect(x, y, dot, dot), MenuTheme.Rule);
+                }
+            }
         }
 
         // Rebuilds the proposed-fix list from scratch using the exact same gate
