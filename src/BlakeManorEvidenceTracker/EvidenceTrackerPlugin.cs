@@ -25,6 +25,9 @@ namespace BlakeManorEvidenceTracker
         public const string PluginName = "Blake Manor Evidence Tracker";
         public const string PluginVersion = "0.0.1";
 
+        private const float WindowWidth = 560f;
+        private const float WindowHeight = 520f;
+
         private class ProposedFix
         {
             public string MysteryName;
@@ -47,8 +50,9 @@ namespace BlakeManorEvidenceTracker
         private ConfigEntry<Key> _fixMenuHotkeyConfig;
 
         private bool _menuOpen;
+        private GameState _previousGameState = GameState.Normal;
         private Vector2 _scrollPos;
-        private Rect _windowRect = new Rect(0f, 0f, 520f, 480f);
+        private Rect _windowRect = new Rect(0f, 0f, WindowWidth, WindowHeight);
         private readonly List<ProposedFix> _proposedFixes = new List<ProposedFix>();
         private string _statusMessage = "";
 
@@ -86,11 +90,52 @@ namespace BlakeManorEvidenceTracker
             }
             if (keyboard[_fixMenuHotkeyConfig.Value].wasPressedThisFrame)
             {
-                _menuOpen = !_menuOpen;
                 if (_menuOpen)
                 {
-                    RescanForFixes();
+                    CloseMenu();
                 }
+                else
+                {
+                    TryOpenMenu();
+                }
+            }
+            if (_menuOpen && keyboard.escapeKey.wasPressedThisFrame)
+            {
+                CloseMenu();
+            }
+        }
+
+        // Mirrors Blake Manor Fast Travel's TryOpenMenu(): GameState.Paused is what actually
+        // frees AC's mouse cursor and suspends first-person camera/movement input while a UI
+        // is up - without setting it, clicks and cursor movement all still go to the game's
+        // own camera-look/movement handling instead of this window, which is why the first
+        // version of this menu was unusable (no mouse control at all).
+        private void TryOpenMenu()
+        {
+            if (KickStarter.stateHandler == null)
+            {
+                return; // AC hasn't finished booting yet (e.g. still on the title screen)
+            }
+            if (KickStarter.stateHandler.gameState != GameState.Normal)
+            {
+                return; // don't pop the menu open mid-cutscene/dialogue/etc.
+            }
+
+            RescanForFixes();
+            _previousGameState = KickStarter.stateHandler.gameState;
+            KickStarter.stateHandler.gameState = GameState.Paused;
+            _menuOpen = true;
+
+            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
+            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
+        }
+
+        private void CloseMenu()
+        {
+            _menuOpen = false;
+            if (KickStarter.stateHandler != null)
+            {
+                KickStarter.stateHandler.gameState = _previousGameState;
             }
         }
 
@@ -100,72 +145,100 @@ namespace BlakeManorEvidenceTracker
             {
                 return;
             }
-            _windowRect.x = (Screen.width - _windowRect.width) / 2f;
-            _windowRect.y = (Screen.height - _windowRect.height) / 2f;
-            _windowRect = GUILayout.Window(GetHashCode(), _windowRect, DrawFixWindow, "Evidence Fix Checklist");
-        }
+            MenuTheme.EnsureBuilt();
+            MenuTheme.ApplyScale(1f);
 
-        private void DrawFixWindow(int windowId)
-        {
+            GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), MenuTheme.Overlay);
+
+            GUI.Box(_windowRect, GUIContent.none, MenuTheme.Panel);
+            GUILayout.BeginArea(_windowRect);
+            GUILayout.Space(18);
+            GUILayout.Label("EVIDENCE FIX CHECKLIST", MenuTheme.Title);
+            GUILayout.Space(4);
+
+            Rect ruleRect = GUILayoutUtility.GetRect(1f, 2f, GUILayout.ExpandWidth(true));
+            ruleRect.x += 60f;
+            ruleRect.width -= 120f;
+            GUI.DrawTexture(ruleRect, MenuTheme.Rule);
+
+            GUILayout.Space(10);
             GUILayout.Label(
-                "Proposed fixes for discovered mysteries whose hypothesis is currently " +
-                "blocked by missing/unfiled essential evidence. Nothing here is applied " +
-                "until you check it and press Apply.");
-
+                "Proposed fixes for discovered mysteries whose hypothesis is currently blocked " +
+                "by missing/unfiled essential evidence. Nothing is applied until checked and " +
+                "confirmed with Apply.", MenuTheme.Subtitle);
             if (!string.IsNullOrEmpty(_statusMessage))
             {
-                GUILayout.Label(_statusMessage);
+                GUILayout.Label(_statusMessage, MenuTheme.Status);
             }
+            GUILayout.Space(12);
 
-            _scrollPos = GUILayout.BeginScrollView(_scrollPos, GUILayout.Height(320f));
+            GUILayout.BeginHorizontal();
+            GUILayout.Space(20);
+            GUILayout.BeginVertical(MenuTheme.ScrollBackground, GUILayout.ExpandHeight(true));
+            GUILayout.Space(6);
+
             if (_proposedFixes.Count == 0)
             {
-                GUILayout.Label("No blocked hypotheses found among discovered mysteries.");
+                GUILayout.FlexibleSpace();
+                GUILayout.Label("No blocked hypotheses found among discovered mysteries.", MenuTheme.Body);
+                GUILayout.FlexibleSpace();
             }
             else
             {
+                _scrollPos = GUILayout.BeginScrollView(_scrollPos);
                 string lastMystery = null;
                 foreach (ProposedFix fix in _proposedFixes)
                 {
                     if (fix.MysteryName != lastMystery)
                     {
-                        GUILayout.Space(8f);
-                        GUILayout.Label($"{fix.MysteryLabel} ({fix.MysteryName})");
+                        GUILayout.Space(10);
+                        GUILayout.Label($"{fix.MysteryLabel} ({fix.MysteryName})", MenuTheme.Subtitle);
                         lastMystery = fix.MysteryName;
                     }
 
                     GUILayout.BeginHorizontal();
+                    GUILayout.Space(10);
                     if (fix.Applied)
                     {
-                        GUILayout.Label($"  [done] {fix.ItemLabel}");
+                        GUILayout.Label($"[done] {fix.ItemLabel}", MenuTheme.Body);
                     }
                     else
                     {
-                        fix.Approved = GUILayout.Toggle(fix.Approved, "");
+                        fix.Approved = GUILayout.Toggle(fix.Approved, "", GUILayout.Width(24f));
                         string action = fix.NeedsAdd ? "add + file" : "file only";
-                        GUILayout.Label($"{fix.ItemLabel} (id={fix.ItemId}, {action})");
+                        GUILayout.Label($"{fix.ItemLabel} (id={fix.ItemId}, {action})", MenuTheme.Body);
                     }
                     GUILayout.EndHorizontal();
                 }
+                GUILayout.EndScrollView();
             }
-            GUILayout.EndScrollView();
 
+            GUILayout.EndVertical();
+            GUILayout.Space(20);
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(14);
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Rescan"))
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Rescan", MenuTheme.CloseButton, GUILayout.Width(100f), GUILayout.Height(32f)))
             {
                 RescanForFixes();
             }
-            if (GUILayout.Button("Apply checked"))
+            GUILayout.Space(10);
+            if (GUILayout.Button("Apply checked", MenuTheme.DestinationButton, GUILayout.Width(140f), GUILayout.Height(32f)))
             {
                 ApplyApprovedFixes();
             }
-            if (GUILayout.Button("Close"))
+            GUILayout.Space(10);
+            if (GUILayout.Button("Close", MenuTheme.CloseButton, GUILayout.Width(100f), GUILayout.Height(32f)))
             {
-                _menuOpen = false;
+                CloseMenu();
             }
+            GUILayout.FlexibleSpace();
             GUILayout.EndHorizontal();
+            GUILayout.Space(16);
 
-            GUI.DragWindow(new Rect(0f, 0f, 10000f, 20f));
+            GUILayout.EndArea();
         }
 
         // Rebuilds the proposed-fix list from scratch using the exact same gate
