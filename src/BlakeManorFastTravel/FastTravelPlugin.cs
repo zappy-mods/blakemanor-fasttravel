@@ -24,7 +24,7 @@ namespace BlakeManorFastTravel
     // the same handle - so on its own this only ever means "this scene has started once",
     // not "you got past whatever normally gates it"). We gate fast travel on 2 as a
     // baseline, then narrow further with HasPassableChecks() - see the comment on
-    // _conditionChecksByHandle - for anything that's actually key- or time-gated.
+    // _doorPathsByHandle - for anything that's actually key- or time-gated.
     //
     // Caveat: this variable is keyed on the room's *handle*, and a single physical room
     // can be represented by several distinct SceneCollection assets (different
@@ -77,7 +77,7 @@ namespace BlakeManorFastTravel
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public class FastTravelPlugin : BaseUnityPlugin
     {
-        public const string PluginGuid = "brian.blakemanor.fasttravel";
+        public const string PluginGuid = "zappymods.blakemanor.fasttravel";
         public const string PluginName = "Blake Manor Fast Travel";
         public const string PluginVersion = "0.0.1";
 
@@ -88,7 +88,14 @@ namespace BlakeManorFastTravel
         private const float MaxWidth = 900f;
         private const float MaxHeight = 820f;
         private const float ResizeHandleSize = 18f;
-        private const float TravelTimeoutSeconds = 45f;
+        // The false positive this timeout exists to filter out (timeScale reading non-1 for
+        // a moment right as the destination becomes current, before the game's own normal
+        // completion sequence gets to resetting it) resolves within about a frame of real
+        // time - nowhere near multiple seconds. 6s/6 poll cycles gives that several times
+        // over as margin while still cutting the wait for a genuine hang down drastically
+        // from the original 45s pick (which was just a generic large safety margin, not
+        // tuned to an observed value).
+        private const float TravelTimeoutSeconds = 6f;
         private const float TravelPollIntervalSeconds = 1f;
 
         private bool _menuOpen;
@@ -98,7 +105,7 @@ namespace BlakeManorFastTravel
         private string _statusMessage = "";
         private Harmony _harmony;
 
-        // User-facing config (BepInEx/config/brian.blakemanor.fasttravel.cfg).
+        // User-facing config (BepInEx/config/zappymods.blakemanor.fasttravel.cfg).
         private ConfigEntry<Key> _hotkeyConfig;
         private ConfigEntry<bool> _diagnosticsConfig;
 
@@ -122,6 +129,7 @@ namespace BlakeManorFastTravel
         private string _travelDestinationPath;
         private float _travelStartTime;
         private float _lastTravelPollTime;
+        private bool _travelDestinationConfirmed;
 
         // Diagnostic-only, gated behind _diagnosticsConfig (see LogKeyedHandleCandidatesOnce):
         // true once we've logged every registered handle - useful for troubleshooting, not
@@ -141,11 +149,50 @@ namespace BlakeManorFastTravel
         // you walk/fast-travel around, not all at once; anything not yet scanned just falls
         // back to the plain room.<handle> >= 2 check, same as before this existed. Only its
         // logging (RegisterDoorLink) is gated behind _diagnosticsConfig.
-        private const float DoorScanIntervalSeconds = 2f;
+        // Now primarily a safety net, not the main trigger - see OnSceneLoadedScanForDoors().
+        // Kept fairly generous since a scan is only "wasted" work once nothing new is loaded to
+        // find, which is most of the time once the scene-loaded event has already covered it.
+        private const float DoorScanIntervalSeconds = 30f;
         private float _lastDoorScanTime;
+        // Grace delay after SceneManager.sceneLoaded before actually scanning: confirmed via a
+        // save load into the Atrium that scanning on the very next frame can run before AC has
+        // finished restoring Hotspot/interaction state from the save file, finding nothing even
+        // though the objects exist a moment later (fixed itself once the player left and
+        // re-entered, a plain scene transition rather than a save load). Not a fixed number of
+        // frames since that's timestep-dependent; a short wall-clock delay comfortably covers it
+        // without meaningfully hurting discovery latency.
+        private const float SceneLoadScanDelaySeconds = 1f;
+        private float? _pendingSceneLoadScanTime;
         private readonly HashSet<int> _scannedActionListIds = new HashSet<int>();
         private string _doorLinksLogPath;
-        private readonly Dictionary<string, List<AC.ActionCheck>> _conditionChecksByHandle = new Dictionary<string, List<AC.ActionCheck>>();
+
+        // Each entry is one door's full action sequence plus which action in it is the actual
+        // scene change - not a pre-filtered list of "genuine" checks. An earlier version tried
+        // to classify individual ActionCheck instances as "real gates" ahead of time via
+        // structural reachability tracing, but that can't handle multiple checks working
+        // together (e.g. "check5==false AND (check6==false OR check7==false)" - the Bar's real
+        // gate): each check considered alone is structurally escapable via some combination of
+        // the others, so all three got wrongly filtered out despite jointly blocking the door
+        // every time. The only way to get this right in general is to not pre-judge individual
+        // checks at all - walk the actual sequence live, using each check's real, current
+        // CheckCondition() result to pick the one branch AC's own runtime would actually take,
+        // exactly like a real click does. See HasPassableChecks() and IsDoorReachableLive().
+        private readonly Dictionary<string, List<(List<AC.Action> Actions, AC.Action Target)>> _doorPathsByHandle =
+            new Dictionary<string, List<(List<AC.Action> Actions, AC.Action Target)>>();
+
+        // A Hotspot-level scan (AC.Button.isDisabled, Hotspot.IsOn(), Hotspot.
+        // provideUseInteraction, and re-checking button.interaction hasn't been swapped to a
+        // different ActionList) was built and tested while chasing the Bar's lock, on the
+        // theory that not every gate lives inside the door's own ActionList. All four read as
+        // "enabled" for the Bar the entire time it was confirmed closed in-game - its real gate
+        // turned out to be a 3-check AND/OR combination *inside* "Bar: Open" itself, which
+        // IsDoorReachableLive() now handles correctly and completely on its own. Removed rather
+        // than kept around unproven: it never once correctly caught a real lock, and it caused
+        // a confirmed regression (the Atrium, which is never locked, showing as blocked after a
+        // save reload) - reloading a save destroys and recreates Hotspot/Interaction
+        // components, and these dictionaries never got cleared, so a stale, Unity-"destroyed"
+        // reference from before the reload permanently poisoned the handle even after a fresh,
+        // valid scan re-registered it right alongside the stale one.
 
         // Fails open (returns true) for a handle with no captured checks - nothing scanned
         // there yet, or it genuinely has no extra condition - so this can only ever narrow
@@ -153,18 +200,71 @@ namespace BlakeManorFastTravel
         // legitimately-visited room becomes unreachable.
         private bool HasPassableChecks(string handle)
         {
-            if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> checks))
+            if (!_doorPathsByHandle.TryGetValue(handle, out List<(List<AC.Action> Actions, AC.Action Target)> paths))
             {
                 return true;
             }
-            foreach (AC.ActionCheck check in checks)
+
+            // OR across paths, not AND: a handle can be reachable via more than one physical
+            // door (multiple Hotspots leading to the same room), each with its own independent
+            // gating - the room should count as passable if any one of the doors we've actually
+            // scanned currently leads there, not only if every door we happen to know about
+            // does.
+            if (_diagnosticsConfig.Value)
             {
-                if (check != null && !check.CheckCondition())
+                Logger.LogInfo($"[BlakeManorFastTravel] HasPassableChecks('{handle}'): {paths.Count} registered path(s), sizes=[{string.Join(",", paths.ConvertAll(p => p.Actions.Count))}]");
+            }
+            foreach ((List<AC.Action> actions, AC.Action target) in paths)
+            {
+                if (IsDoorReachableLive(actions, 0, target, new HashSet<int>(), handle))
                 {
-                    return false;
+                    return true;
                 }
             }
-            return true;
+            if (_diagnosticsConfig.Value)
+            {
+                Logger.LogInfo($"[BlakeManorFastTravel] HasPassableChecks('{handle}'): no known path currently reaches the door -> FAIL");
+            }
+            return false;
+        }
+
+        // Walks one door's action sequence starting from index 0 (the same entry point AC uses
+        // for a real click - see ActionList.Interact()/BeginActionList(0, ...)), using each
+        // ActionCheck's real, current CheckCondition() to pick the one branch that would
+        // actually be taken, until it either reaches target (door reachable right now) or runs
+        // out of path (Stop/RunCutscene without ever reaching it - genuinely blocked). visited
+        // guards against infinite loops on any backward jump.
+        private bool IsDoorReachableLive(List<AC.Action> actions, int index, AC.Action target, HashSet<int> visited, string handleForLogging)
+        {
+            if (index < 0 || index >= actions.Count || !visited.Add(index))
+            {
+                return false;
+            }
+
+            AC.Action current = actions[index];
+            if (current == target)
+            {
+                return true;
+            }
+
+            if (current is AC.ActionCheck check)
+            {
+                bool passed = check.CheckCondition();
+                if (_diagnosticsConfig.Value)
+                {
+                    Logger.LogInfo(
+                        $"[BlakeManorFastTravel] HasPassableChecks('{handleForLogging}'): " +
+                        $"[{index}] {check.GetType().Name} -> {(passed ? "true" : "fail")}");
+                }
+                return passed
+                    ? ResolveNextIndex(actions, check.resultActionTrue, check.skipActionTrue, check.skipActionTrueActual, index, out int trueNext) &&
+                        IsDoorReachableLive(actions, trueNext, target, visited, handleForLogging)
+                    : ResolveNextIndex(actions, check.resultActionFail, check.skipActionFail, check.skipActionFailActual, index, out int failNext) &&
+                        IsDoorReachableLive(actions, failNext, target, visited, handleForLogging);
+            }
+
+            return ResolveNextIndex(actions, current.endAction, current.skipAction, current.skipActionActual, index, out int next) &&
+                IsDoorReachableLive(actions, next, target, visited, handleForLogging);
         }
 
         private void Awake()
@@ -194,11 +294,54 @@ namespace BlakeManorFastTravel
                     Logger.LogWarning("[BlakeManorFastTravel] Failed to open door_links.log: " + ex.Message);
                 }
             }
+
+            // Investigation-only (Bar mechanism): every check we can read off Hotspot/Button
+            // state directly (isDisabled, IsOn(), provideUseInteraction, interaction-target
+            // swap) came back "enabled" for a door confirmed closed in-game, so read AC's own
+            // ground truth instead of inferring it - AC.EventManager.OnHotspotInteract fires
+            // with the actual resolved Button (or null) right after PlayerInteraction.
+            // ClickButton() picks it, the same event InteractionUIPanel subscribes to for its
+            // own UI updates. This tells us directly whether a click is even reaching Use with
+            // the door's button at all, without needing a live debugger.
+            AC.EventManager.OnHotspotInteract += LogHotspotInteractDiagnostic;
+
+            // Door discovery used to run purely on a 2s poll, forever, for the entire session -
+            // calling FindObjectsByType<AC.ActionList>() (a full walk of every loaded object)
+            // even during the overwhelming majority of play spent just standing in one room
+            // with nothing new to find. Scanning right when a scene actually finishes loading
+            // is both cheaper (only runs when there's realistically something new) and more
+            // responsive (no up-to-2s lag before a freshly-loaded room's doors are known).
+            // SceneManager.sceneLoaded is the standard Unity event, unrelated to AC/EHKickStarter
+            // specifically, so it's reliable REGARDLESS of how a scene got loaded (walking, fast
+            // travel, a cutscene). The Update() poll stays on as a much-less-frequent safety net
+            // (see DoorScanIntervalSeconds) in case anything ever loads without that event firing.
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnSceneLoadedScanForDoors;
+        }
+
+        private void OnSceneLoadedScanForDoors(UnityEngine.SceneManagement.Scene scene, UnityEngine.SceneManagement.LoadSceneMode mode)
+        {
+            _pendingSceneLoadScanTime = Time.unscaledTime + SceneLoadScanDelaySeconds;
+        }
+
+        private void LogHotspotInteractDiagnostic(AC.Hotspot hotspot, AC.Button button)
+        {
+            if (!_diagnosticsConfig.Value)
+            {
+                return;
+            }
+            string interactionName = button?.interaction != null ? button.interaction.name
+                : button?.assetFile != null ? $"(asset: {button.assetFile.name})"
+                : button != null ? "(button set, no interaction/asset)"
+                : "(null - nothing ran)";
+            Logger.LogInfo(
+                $"[BlakeManorFastTravel] OnHotspotInteract: hotspot='{hotspot?.name}' -> {interactionName}");
         }
 
         private void OnDestroy()
         {
             _harmony?.UnpatchSelf();
+            AC.EventManager.OnHotspotInteract -= LogHotspotInteractDiagnostic;
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnSceneLoadedScanForDoors;
         }
 
         private void Update()
@@ -209,7 +352,7 @@ namespace BlakeManorFastTravel
             }
 
             // Always runs, regardless of the diagnostics toggle: this is what populates
-            // _conditionChecksByHandle, which the key/time-gating feature depends on - only
+            // _doorPathsByHandle, which the key/time-gating feature depends on - only
             // its *logging* is diagnostics-gated (see RegisterDoorLink).
             ScanForDoorLinksThrottled();
             if (_diagnosticsConfig.Value)
@@ -302,16 +445,23 @@ namespace BlakeManorFastTravel
         {
             if (Time.unscaledTime - _travelStartTime > TravelTimeoutSeconds)
             {
-                // If this ever actually fires, it means the destination never became the
-                // open collection within 45s of a successful ChangeScene() call - i.e. a
-                // load that really did hang, not just run long. Worth a loud log line: this
-                // is the single strongest signal we have for diagnosing a stuck black
-                // screen after the fact, since nothing else here would otherwise record it.
+                // Getting here means one of two genuinely-stuck cases, both worth a loud log
+                // line since nothing else would otherwise record it: either the destination
+                // never became the open collection at all within 45s (the load itself hung),
+                // or it did become current but Time.timeScale never came back to 1 in all that
+                // time (the on-enter-cutscene/timescale race below, but given a full 45s to
+                // resolve on its own first rather than judged off a single reading). Waiting
+                // out the whole timeout before escalating is deliberate: a single "timeScale
+                // != 1" reading taken the instant the destination becomes current turned out
+                // to be too eager a trigger (see below) and doesn't distinguish a genuine hang
+                // from a normal load that just hasn't finished its own cleanup yet.
                 Logger.LogWarning(
                     $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' did not complete within " +
-                    $"{TravelTimeoutSeconds}s (still active scene: " +
+                    $"{TravelTimeoutSeconds}s (destinationConfirmed={_travelDestinationConfirmed}, " +
+                    $"timeScale={Time.timeScale}, active scene: " +
                     $"'{UnityEngine.SceneManagement.SceneManager.GetActiveScene().name}', " +
-                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Giving up on the toast.");
+                    $"IsLoading={KickStarter.sceneChanger?.IsLoading()}). Escalating to full recovery.");
+                RecoverFromPossibleHang();
                 _traveling = false;
                 return;
             }
@@ -323,43 +473,54 @@ namespace BlakeManorFastTravel
             _lastTravelPollTime = Time.unscaledTime;
 
             SpookyDoorway.SceneCollection current = EHKickStarter.SceneCollectionsManager?.GetCurrentlyOpenCollection();
-            if (current != null && current.Path == _travelDestinationPath)
+            if (current == null || current.Path != _travelDestinationPath)
+            {
+                return;
+            }
+
+            if (!_travelDestinationConfirmed)
             {
                 // gameState is what actually gates player movement/animation throughout AC -
                 // logging it here lets us tell "scene loaded fine but player control never
                 // came back" (gameState stuck off Normal) apart from "scene itself never
                 // finished" (the timeout branch above), which look identical in-game but
-                // need different fixes.
+                // need different fixes. Logged once, on the poll where the destination first
+                // matches, rather than every poll thereafter while we wait on timeScale below.
                 Logger.LogInfo(
                     $"[BlakeManorFastTravel] Travel to '{_travelDestinationPath}' completed after " +
                     $"{Time.unscaledTime - _travelStartTime:0.0}s. gameState={KickStarter.stateHandler?.gameState} " +
                     $"playerNull={KickStarter.player == null} timeScale={Time.timeScale}");
+                _travelDestinationConfirmed = true;
+            }
 
-                // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
-                // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
-                // shows the stuck action is an early step in a room's on-enter "OnStart"
-                // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
-                // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
-                // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
-                // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
-                // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
-                // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a
-                // race between "cutscene starts" and "timescale resets to 1 after loading"
-                // would freeze it on frame one forever if it loses that race - explaining both
-                // the specific stuck actions we've seen and why this is intermittent (a race,
-                // not a deterministic bug) rather than affecting every room every time.
-                // Only escalate to the full reset (KillAllLists/StopConversation/subsystem
-                // toggles) when Time.timeScale being stuck off 1 actually signals something
-                // is wrong - confirmed the reliable tell for this exact race. Calling it
-                // unconditionally on every clean travel turned out not to be harmless after
-                // all: it was resetting AC's input/interaction systems and stopping any
-                // brand-new conversation right as one started (e.g. opening a book moments
-                // after a totally healthy arrival), causing exactly the kind of input
-                // jank/half-working clicks that motivated making this conditional.
-                if (Time.timeScale != 1f)
-                {
-                    RecoverFromPossibleHang();
-                }
+            // The actual root cause behind the stuck-Cutscene/hung-ActionList hangs, best
+            // evidence to date: every one we've caught mid-freeze via LogActiveActionLists
+            // shows the stuck action is an early step in a room's on-enter "OnStart"
+            // sequence (ActionFade, ActionFMODTriggerParameterChange, etc.) whose Run()
+            // deliberately defers to a later frame (see ActionFMODTriggerParameterChange's
+            // skippedFrame gate) - and every hang's Player.log shows "Setting timescale to
+            // 1" only ever appearing as part of forced-shutdown cleanup, never mid-hang,
+            // meaning Time.timeScale stayed at its paused-for-loading value (0) the whole
+            // time. If that on-enter cutscene's frame-deferral is scaled-time-based, a race
+            // between "cutscene starts" and "timescale resets to 1 after loading" would
+            // freeze it on frame one forever if it loses that race - explaining both the
+            // specific stuck actions we've seen and why this is intermittent (a race, not a
+            // deterministic bug) rather than affecting every room every time.
+            //
+            // Still, timeScale often reads non-1 for a moment right as the destination
+            // becomes current simply because the game's own normal completion sequence
+            // hasn't gotten to resetting it yet - not because anything is actually stuck.
+            // Escalating to the full reset (KillAllLists/StopConversation/subsystem toggles)
+            // off that single reading turned out not to be harmless: it was resetting AC's
+            // input/interaction systems and stopping any brand-new conversation right as one
+            // started (e.g. opening a book moments after a totally healthy arrival), causing
+            // exactly the kind of input jank/half-working clicks that motivated this rework.
+            // So: keep polling (stay "traveling", no escalation) for as long as timeScale
+            // hasn't self-corrected, and only escalate once we hit the timeout branch above -
+            // giving a normal-but-slightly-delayed reset the full 45s to resolve on its own
+            // before we conclude it's a genuine hang.
+            if (Time.timeScale == 1f)
+            {
                 _traveling = false;
             }
         }
@@ -486,15 +647,26 @@ namespace BlakeManorFastTravel
                 }
             }
 
+            // gameState is what actually gates player movement/input/animation throughout AC
+            // (see TryOpenMenu()'s check on it) - entirely separate from the StateHandler
+            // subsystem flags just reset above. A stuck on-enter cutscene/ActionList leaves
+            // this at Cutscene, and killing the list below doesn't undo that: nothing else
+            // sets it back. Confirmed missing in practice - the automatic (non-Shift+F9) path
+            // used to leave gameState stuck at Cutscene even after everything else here ran,
+            // only actually clearing once the player opened and closed the emergency menu,
+            // which happens to reset it as a side effect (see CloseMenu()). Both callers of
+            // this method run before anything of ours has put up a menu of its own, so there's
+            // no legitimate Paused-for-our-own-UI state here to preserve - forcing back to
+            // Normal is safe and, per everything else in this method, idempotent when nothing
+            // was actually stuck.
+            if (KickStarter.stateHandler != null && KickStarter.stateHandler.gameState != GameState.Normal)
+            {
+                Logger.LogWarning($"[BlakeManorFastTravel] gameState was {KickStarter.stateHandler.gameState} - forcing back to Normal.");
+                KickStarter.stateHandler.gameState = GameState.Normal;
+            }
+
             LogActiveActionLists();
-            try
-            {
-                AC.ActionListManager.KillAll();
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("[BlakeManorFastTravel] KillAllLists() failed: " + ex.Message);
-            }
+            SkipStuckActionLists();
 
             try
             {
@@ -546,6 +718,69 @@ namespace BlakeManorFastTravel
             LogActiveListsFrom("asset", KickStarter.actionListAssetManager?.activeLists);
         }
 
+        // Replaces the AC.ActionListManager.KillAll() this used to call. KillAll() doesn't
+        // just unstick the one frozen action - it drops every remaining step in that same
+        // list too, including legitimate later ones (var/inventory setup, chained
+        // ActionRunActionList calls, etc.) that would have run fine once the stuck action got
+        // past. Confirmed root cause of a real regression: killing a room's OnStart list
+        // partway through was truncating setup that later interactions (e.g. examining a book)
+        // depended on, breaking dialogue/interaction in that room even though the visible
+        // stuck-fade/frozen-camera symptom itself was gone.
+        //
+        // ActionList.Skip(startIndex) is AC's own built-in "skip cutscene" mechanic - the
+        // same one the game's own skip-cutscene button uses - and doesn't have that problem:
+        // it re-runs the list from its original start index calling each action's own Skip()
+        // override (e.g. ActionFade.Skip() jumps straight to the fade's end state) all the
+        // way through to the list's natural completion, rather than truncating it. Actions
+        // without a Skip() override fall back to Action.Skip() calling Run() - re-running an
+        // already-completed step like a var-set is idempotent by AC's own convention, since
+        // this is the exact path an official cutscene skip takes regardless of where the
+        // player currently is in the sequence when they trigger it.
+        //
+        // ActiveList itself also exposes a Skip(), but it's gated on an internal skip-queue
+        // flag (inSkipQueue) that a stuck list was never enqueued into, so calling it directly
+        // would silently no-op - going straight to the underlying ActionList.Skip() avoids
+        // that gate. Asset-based ActionLists aren't handled here: every hang caught so far has
+        // logged "No active asset ActionLists", so there's no observed case to fix, and
+        // replicating ActiveList.Skip()'s asset-list path (DestroyAssetList +
+        // AdvGame.SkipActionListAsset) blind isn't worth the risk without one to verify against.
+        private void SkipStuckActionLists()
+        {
+            List<AC.ActiveList> lists = KickStarter.actionListManager?.activeLists;
+            if (lists == null)
+            {
+                return;
+            }
+
+            foreach (AC.ActiveList activeList in lists)
+            {
+                if (activeList?.actionList == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Logger.LogWarning(
+                        $"[BlakeManorFastTravel] Skipping stuck scene ActionList '{activeList.actionList.name}' " +
+                        $"(from index {activeList.startIndex}) instead of killing it, so later steps still run.");
+                    activeList.actionList.Skip(activeList.startIndex);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning($"[BlakeManorFastTravel] Skip() on '{activeList.actionList.name}' failed: {ex.Message}");
+                }
+            }
+
+            List<AC.ActiveList> assetLists = KickStarter.actionListAssetManager?.activeLists;
+            if (assetLists != null && assetLists.Count > 0)
+            {
+                Logger.LogWarning(
+                    $"[BlakeManorFastTravel] {assetLists.Count} active asset ActionList(s) present during recovery " +
+                    "- not auto-skipped (never observed stuck in practice); flag for follow-up if this shows up.");
+            }
+        }
+
         private void LogActiveListsFrom(string kind, List<AC.ActiveList> lists)
         {
             if (lists == null || lists.Count == 0)
@@ -587,16 +822,20 @@ namespace BlakeManorFastTravel
             }
 
             // Reported symptom: the camera detaching/spinning after a plain F9 open+close,
-            // with no travel involved at all - so this needs the same recovery the
-            // emergency path gets, not just the travel-completion path. But only when
-            // Time.timeScale being stuck off 1 actually signals something's wrong -
-            // unconditionally resetting AC's input/interaction systems and stopping any
-            // conversation on *every* close turned out to interfere with legitimate
-            // gameplay that happened to follow shortly after (see the comment in
-            // UpdateTravelingState() for the same fix, and why it matters here too).
+            // with no travel involved at all. The full reset (KillAllLists/StopConversation/
+            // subsystem toggles) used to run here too whenever Time.timeScale looked stuck,
+            // but a single close is a one-shot event with no chance to wait and see whether
+            // that's a genuine hang or just momentary load-completion lag (unlike
+            // UpdateTravelingState(), which now waits out the full timeout before
+            // escalating) - and firing the full reset eagerly is exactly what caused
+            // brand-new conversations right after a clean close/travel to lose auto-advance.
+            // So this only does the cheap, side-effect-free part: nudge timeScale itself
+            // back to 1 if it's stuck. If something is actually wrong beyond that, Shift+F9
+            // (ForceOpenMenu(), a deliberate user action) still runs the full recovery.
             if (Time.timeScale != 1f)
             {
-                RecoverFromPossibleHang();
+                Logger.LogWarning($"[BlakeManorFastTravel] timeScale was {Time.timeScale} on menu close - forcing back to 1.");
+                Time.timeScale = 1f;
             }
         }
 
@@ -641,16 +880,36 @@ namespace BlakeManorFastTravel
                 GVar discoveredVar = GlobalVariables.GetVariable("room." + ehCollection.handle);
                 if (discoveredVar == null || discoveredVar.val < 2)
                 {
+                    if (_diagnosticsConfig.Value)
+                    {
+                        Logger.LogInfo(
+                            $"[BlakeManorFastTravel] Excluding '{ehCollection.handle}': room.{ehCollection.handle} = " +
+                            $"{(discoveredVar == null ? "(no such variable)" : discoveredVar.val.ToString())} (needs >= 2).");
+                    }
                     continue; // not yet actually visited by the player
                 }
 
-                // Skip anything that can't support today's global appearance state - this
-                // is the exact bounds check EHSceneChanger.LoadLevelASync itself omits
-                // before indexing generatedScenesLoadingGroup, so anything that fails it
-                // would crash on load.
-                if (currentAppearanceIndex < 0 ||
-                    currentAppearanceIndex >= ehCollection.generatedScenesLoadingGroup.Count)
+                // Skip anything that can't support today's global appearance state - but
+                // only for collections that actually use generatedScenesLoadingGroup in the
+                // first place. Confirmed via EHSceneChanger.LoadLevelASync's own source: it
+                // guards this exact array with `.Count > 0` before ever indexing into it, and
+                // falls back to RuntimeSceneAssets (unindexed, no appearance-state lookup)
+                // when it's empty - which is the normal case for nearly every room, not a
+                // crash risk. The original version of this check omitted that guard and
+                // ended up excluding almost every candidate unconditionally, mistaking "this
+                // room doesn't use the appearance-indexed group at all" for "this room can't
+                // support today's appearance" - see the 0-rooms-in-menu bug this caused.
+                if (ehCollection.generatedScenesLoadingGroup.Count > 0 &&
+                    (currentAppearanceIndex < 0 ||
+                     currentAppearanceIndex >= ehCollection.generatedScenesLoadingGroup.Count))
                 {
+                    if (_diagnosticsConfig.Value)
+                    {
+                        Logger.LogInfo(
+                            $"[BlakeManorFastTravel] Excluding '{ehCollection.handle}': currentAppearanceIndex=" +
+                            $"{currentAppearanceIndex} out of range for generatedScenesLoadingGroup.Count=" +
+                            $"{ehCollection.generatedScenesLoadingGroup.Count}.");
+                    }
                     continue;
                 }
 
@@ -676,6 +935,15 @@ namespace BlakeManorFastTravel
 
             List<EHSceneCollection> list = new List<EHSceneCollection>(bestByHandle.Values);
             list.Sort((a, b) => string.Compare(DisplayName(a), DisplayName(b), StringComparison.OrdinalIgnoreCase));
+
+            if (_diagnosticsConfig.Value)
+            {
+                Logger.LogInfo(
+                    $"[BlakeManorFastTravel] GetDiscoveredDestinations(): {list.Count} destination(s) " +
+                    $"from {manager.Collections.Count} total collection(s); currentAppearanceIndex=" +
+                    $"{currentAppearanceIndex}; current='{current?.Path ?? "(null)"}'.");
+            }
+
             return list;
         }
 
@@ -728,13 +996,12 @@ namespace BlakeManorFastTravel
 
         // Every DoorScanIntervalSeconds, scans every AC.ActionList currently loaded
         // (regardless of which scene it's in) for ones that also contain an ActionScene_EH
-        // - i.e. a door's Interaction. Any AC.ActionCheck-derived action found in the same
-        // list (an inventory check for a key door, an ActionEHCheckTime for a time-gated
-        // one, etc.) gets registered against that destination handle in
-        // _conditionChecksByHandle for HasPassableChecks() to call live later - see the
-        // comment on that field for why we don't need to know or hand-verify what kind of
-        // check it is. Also logs what it finds to _doorLinksLogPath, which is how we
-        // originally identified ActionEHCheckTime as the Dining Room's gate.
+        // - i.e. a door's Interaction. The whole action sequence plus which action is the door
+        // gets registered against that destination handle in _doorPathsByHandle for
+        // HasPassableChecks() to walk live later - see the comment on that field for why the
+        // whole sequence is kept rather than pre-classifying individual checks. Also logs what
+        // it finds to _doorLinksLogPath, which is how we originally identified ActionEHCheckTime
+        // as the Dining Room's gate.
         //
         // Doors only exist as live objects in whatever scene they're placed in, so this
         // only ever sees doors in scenes that have actually loaded - it builds up coverage
@@ -742,10 +1009,13 @@ namespace BlakeManorFastTravel
         // skipped on later passes so walking back through an area doesn't redo the work.
         private void ScanForDoorLinksThrottled()
         {
-            if (Time.unscaledTime - _lastDoorScanTime < DoorScanIntervalSeconds)
+            bool pendingSceneLoadScanDue = _pendingSceneLoadScanTime.HasValue && Time.unscaledTime >= _pendingSceneLoadScanTime.Value;
+            bool periodicSafetyNetDue = Time.unscaledTime - _lastDoorScanTime >= DoorScanIntervalSeconds;
+            if (!pendingSceneLoadScanDue && !periodicSafetyNetDue)
             {
                 return;
             }
+            _pendingSceneLoadScanTime = null;
             _lastDoorScanTime = Time.unscaledTime;
 
             AC.ActionList[] actionLists = UnityEngine.Object.FindObjectsByType<AC.ActionList>(
@@ -780,18 +1050,47 @@ namespace BlakeManorFastTravel
             }
         }
 
+        // Continue -> next sequential index; Skip -> skipActionActual's index if set, else the
+        // raw skipAction index; Stop/RunCutscene -> no further actions reachable in this list
+        // (RunCutscene diverges to a whole separate Cutscene/asset, not indices in this one).
+        private static bool ResolveNextIndex(
+            List<AC.Action> actions, ResultAction resultAction, int skipAction, AC.Action skipActionActual, int currentIndex, out int nextIndex)
+        {
+            switch (resultAction)
+            {
+                case ResultAction.Continue:
+                    nextIndex = currentIndex + 1;
+                    return nextIndex < actions.Count;
+                case ResultAction.Skip:
+                    nextIndex = (skipActionActual != null && actions.Contains(skipActionActual))
+                        ? actions.IndexOf(skipActionActual)
+                        : (skipAction < 0 ? 0 : skipAction);
+                    return nextIndex >= 0 && nextIndex < actions.Count;
+                default: // Stop, RunCutscene
+                    nextIndex = -1;
+                    return false;
+            }
+        }
+
         private void RegisterDoorLink(AC.ActionList actionList, ActionScene_EH sceneAction, List<AC.ActionCheck> checks)
         {
             string handle = sceneAction.sceneHandle;
-            if (checks.Count > 0)
+            if (!_doorPathsByHandle.TryGetValue(handle, out List<(List<AC.Action> Actions, AC.Action Target)> existingPaths))
             {
-                if (!_conditionChecksByHandle.TryGetValue(handle, out List<AC.ActionCheck> existing))
-                {
-                    existing = new List<AC.ActionCheck>();
-                    _conditionChecksByHandle[handle] = existing;
-                }
-                existing.AddRange(checks);
+                existingPaths = new List<(List<AC.Action> Actions, AC.Action Target)>();
+                _doorPathsByHandle[handle] = existingPaths;
             }
+            // A snapshot copy, not a live reference to actionList.actions: confirmed via the
+            // Walled Garden (three separate doors leading to it) that AC mutates/clears an
+            // ActionList's own .actions list at some point after registration - possibly on
+            // scene teardown/ResetList() as the originating room unloads - and since we'd
+            // stored a direct reference to that same list object, every registered path for a
+            // handle went from its real action count down to 0 once its room was left, making
+            // the door look permanently unreachable from then on even though nothing about the
+            // actual gate changed. The individual Action objects inside are still the same
+            // live references (needed so CheckCondition() stays accurate) - only the
+            // *container* is copied, so external mutation of the original list can't affect us.
+            existingPaths.Add((new List<AC.Action>(actionList.actions), sceneAction));
 
             if (!_diagnosticsConfig.Value)
             {
@@ -804,6 +1103,34 @@ namespace BlakeManorFastTravel
             string line =
                 $"[{DateTime.Now:HH:mm:ss}] destHandle='{handle}' fromRoom='{fromHandle}' " +
                 $"actionList='{actionList.name}' checks=[{checkTypeNames}]";
+
+            // Full ordered dump too: this is what found the Bar's real gate - a three-check
+            // AND/OR combination (see _doorPathsByHandle) that no per-check classification
+            // could have caught, only seeing the actual sequence and each action's own
+            // branching (every AC.Action has endAction/skipAction, not just ActionCheck) could.
+            // Kept as a one-time structural reference; HasPassableChecks()'s own live walk logs
+            // each check's real pass/fail result on top of this when it actually runs.
+            List<string> actionDump = new List<string>();
+            for (int i = 0; i < actionList.actions.Count; i++)
+            {
+                AC.Action a = actionList.actions[i];
+                if (a == null)
+                {
+                    actionDump.Add($"[{i}] null");
+                    continue;
+                }
+                if (a is AC.ActionCheck ac)
+                {
+                    actionDump.Add(
+                        $"[{i}] {a.GetType().Name} (true->{ac.resultActionTrue}/{ac.skipActionTrue}, " +
+                        $"fail->{ac.resultActionFail}/{ac.skipActionFail})");
+                }
+                else
+                {
+                    actionDump.Add($"[{i}] {a.GetType().Name} (end->{a.endAction}/{a.skipAction})");
+                }
+            }
+            Logger.LogInfo($"[BlakeManorFastTravel] '{actionList.name}' full actions: {string.Join(" | ", actionDump)}");
 
             Logger.LogInfo("[BlakeManorFastTravel] " + line);
             try
@@ -1019,12 +1346,15 @@ namespace BlakeManorFastTravel
                 // Belt-and-suspenders re-check: GetDiscoveredDestinations() should only
                 // ever hand us an in-bounds destination, but re-verify right before the
                 // scene load actually happens (the source of truth this mirrors is
-                // EHSceneChanger.LoadLevelASync's generatedScenesLoadingGroup[index]
-                // lookup, which has no bounds check of its own and is what crashes the
-                // game if handed a stale/incompatible variant).
+                // EHSceneChanger.LoadLevelASync's generatedScenesLoadingGroup[index] lookup -
+                // which the game itself only ever reaches after its own `.Count > 0` guard,
+                // so an empty group here is the normal "this room doesn't use that array"
+                // case, not a crash risk - see the matching comment in
+                // GetDiscoveredDestinations()).
                 int currentAppearanceIndex = (int)SceneAppearanceController.sceneState;
-                if (currentAppearanceIndex < 0 ||
-                    currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count)
+                if (destination.generatedScenesLoadingGroup.Count > 0 &&
+                    (currentAppearanceIndex < 0 ||
+                     currentAppearanceIndex >= destination.generatedScenesLoadingGroup.Count))
                 {
                     _statusMessage = "Can't fast travel there right now - try again after moving normally.";
                     return;
@@ -1076,6 +1406,7 @@ namespace BlakeManorFastTravel
                 _traveling = true;
                 _travelDestinationPath = destination.Path;
                 _travelStartTime = Time.unscaledTime;
+                _travelDestinationConfirmed = false;
             }
             catch (Exception ex)
             {
