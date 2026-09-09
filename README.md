@@ -34,7 +34,7 @@ Press **F9** in-game to open the fast-travel menu. Click a destination to travel
 
 ### Configuration
 
-After running the game once with the mod installed, a config file appears at `BepInEx/config/brian.blakemanor.fasttravel.cfg`:
+After running the game once with the mod installed, a config file appears at `BepInEx/config/zappymods.blakemanor.fasttravel.cfg`:
 
 - **General.Hotkey** — the key that opens/closes the menu (default `F9`). Accepts any [Unity InputSystem Key](https://docs.unity3d.com/Packages/com.unity.inputsystem@1.7/api/UnityEngine.InputSystem.Key.html) name.
 - **Diagnostics.EnableDiagnosticLogging** — off by default. Turn this on only if asked to when reporting a bug; it adds extra logging (and a `door_links.log` file next to the DLL) to help troubleshoot issues.

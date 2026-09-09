@@ -15,3 +15,4 @@ Initial release.
 
 ### Fixed
 - Several base-game issues that fast travel's ability to jump directly between any two rooms exposed but normal door-by-door movement mostly avoids, including a crash from loading an out-of-date scene variant, a couple of severe log-spam performance hits that could make a scene load look frozen for a long time, and a `Time.timeScale` race that could leave a room's on-enter cutscene (and the player) stuck indefinitely.
+- Automatic recovery from that stuck-cutscene/hung-conversation race, plus a manual `Shift+F9` fallback for cases it doesn't catch (a black-screen/camera-detach after closing the menu, or a stuck PixelCrushers conversation). Recovery only escalates to its full reset after a genuine timeout now, rather than off a single `timeScale` reading.

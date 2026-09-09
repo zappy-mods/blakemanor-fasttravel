@@ -1,0 +1,51 @@
+name: Upload release to Nexus Mods
+
+# Fires when a GitHub Release is published. Doesn't build anything itself - the plugin
+# has to be compiled against the game's own (proprietary, not-redistributable) reference
+# assemblies, which a hosted runner doesn't have and never should via a committed copy.
+# The release zip is built locally as always (see README's "Building from source") and
+# attached to the GitHub Release when it's created; this workflow just takes that already-
+# built asset and pushes it to Nexus Mods as a new file version.
+on:
+  release:
+    types: [published]
+
+jobs:
+  upload-to-nexus:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release zip asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "BlakeManorFastTravel-*.zip" \
+            --dir dist
+          ls -la dist
+
+      - name: Derive version string from tag
+        id: version
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Find downloaded zip
+        id: zip
+        run: echo "path=$(ls dist/BlakeManorFastTravel-*.zip)" >> "$GITHUB_OUTPUT"
+
+      # Pinned to a commit SHA (not a floating tag) for supply-chain safety, since this
+      # handles a Nexus Mods API key. Official Nexus-Mods org action, currently in open
+      # beta - update the pin deliberately, not via Dependabot auto-merge, until it's out
+      # of beta.
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@c96019556046053aa26044b44396cd38929daf23 # v1.0.0-beta.10
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          mod_id: ${{ vars.NEXUS_MOD_ID }}
+          file_id: ${{ vars.NEXUS_FILE_ID }}
+          filename: ${{ steps.zip.outputs.path }}
+          version: ${{ steps.version.outputs.value }}
+          display_name: Blake Manor Fast Travel v${{ steps.version.outputs.value }}
+          changelog: ${{ github.event.release.body }}
+          update_mod_version: true
